@@ -1,0 +1,8 @@
+/v/*
+  X-Robots-Tag: noindex, nofollow, noai, noimageai
+
+/embed/*
+  X-Robots-Tag: noindex, nofollow, noai, noimageai
+
+/*
+  X-Robots-Tag: noai, noimageai

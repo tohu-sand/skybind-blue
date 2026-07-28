@@ -1,0 +1,36 @@
+{
+  "name": "skybind",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "wrangler pages deploy dist",
+    "db:apply": "wrangler d1 execute skybind-db --local --file=./schema.sql",
+    "db:apply:remote": "wrangler d1 execute skybind-db --remote --file=./schema.sql",
+    "db:reset:local": "wrangler d1 execute skybind-db --local --file=./reset.sql"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.20.11",
+    "@atproto/oauth-client-browser": "^0.4.1",
+    "hono": "^4.6.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251221.0",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.10",
+    "wrangler": "^4.63.0"
+  }
+}

@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: 'Zen Kaku Gothic Antique', 'IBM Plex Sans', system-ui, sans-serif;
+  background-image:
+    radial-gradient(1100px circle at 12% -15%, rgba(240, 90, 40, 0.22), transparent 55%),
+    radial-gradient(900px circle at 90% 8%, rgba(15, 106, 166, 0.2), transparent 50%),
+    linear-gradient(180deg, #fbf6ea 0%, #f2efe6 55%, #ece6d8 100%);
+  background-size: auto, auto, 100% 100%;
+  background-repeat: no-repeat;
+  background-color: #ece6d8;
+  color: #121316;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+@supports (height: 100svh) {
+  body,
+  #root {
+    min-height: 100svh;
+  }
+
+  .min-h-screen {
+    min-height: 100svh;
+  }
+
+  .h-screen {
+    height: 100svh;
+  }
+}
+
+@supports not (height: 100svh) {
+  html {
+    height: -webkit-fill-available;
+  }
+
+  body,
+  #root {
+    min-height: -webkit-fill-available;
+  }
+
+  .min-h-screen {
+    min-height: -webkit-fill-available;
+  }
+
+  .h-screen {
+    height: -webkit-fill-available;
+  }
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img {
+  user-select: none;
+}
+
+.textarea-autogrow {
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.textarea-autogrow::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+::selection {
+  background: rgba(240, 90, 40, 0.25);
+}
