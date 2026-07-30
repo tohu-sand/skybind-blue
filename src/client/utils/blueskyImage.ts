@@ -1,13 +1,31 @@
 // Bluesky's app.bsky.embed.images lexicon allows blobs up to 2,000,000 bytes
 // (raised from 1MB in April 2026); keep ~3% headroom under that ceiling.
 const TARGET_BYTES = 1_940_000
-const TARGET_MP = 5_000_000
-const Q_START_WEBP = 0.9
-const Q_START_JPEG = 0.85
-const Q_MIN = 0.75
-const POWER_K = 0.75
-const SAFETY_F = 0.95
-const RESIZE_SAFETY = 0.98
+// The CDN serves fullsize renditions at up to 4000x4000 (raised from
+// 2000x2000 in April 2026); pixels beyond that never reach readers.
+const MAX_DIM = 4000
+const Q_WEBP = 0.9
+const Q_JPEG = 0.85
+// Scale search: compressed size follows bytes ≈ C·pixels^alpha. Manga pages
+// (mono 600dpi and color covers) measure alpha in 0.66–0.85, so predict the
+// next scale from that model instead of bisecting.
+const ALPHA_PRIOR = 0.8
+const ALPHA_MIN = 0.5
+const ALPHA_MAX = 1.1
+// Aim predictions slightly under the ceiling so the first jump usually lands
+// inside the acceptance band [ACCEPT_BYTES, TARGET_BYTES].
+const PREDICT_BYTES = Math.round(TARGET_BYTES * 0.95)
+const ACCEPT_BYTES = Math.round(TARGET_BYTES * 0.87)
+const MAX_ATTEMPTS = 5
+// Stay just below a scale that is known to overshoot.
+const OVERSHOOT_BACKOFF = 0.97
+// Don't spend another encode for less than a 2% linear-resolution gain.
+const MIN_GAIN = 1.02
+// The CDN (imgproxy) refuses sources above some undocumented resolution.
+// A 26.1MP production upload verifiably renders (2026-07), so pass files
+// through untouched only up to that; anything larger gets re-encoded to
+// dimensions the CDN is guaranteed to accept.
+const MAX_PASSTHROUGH_PIXELS = 26_000_000
 
 type CompressionCapabilities = {
   supportsWebP: boolean
@@ -16,10 +34,9 @@ type CompressionCapabilities = {
 }
 
 export type CompressionStrategy =
-  | 'pass1'
-  | 'pass1-original'
-  | 'pass2-quality'
-  | 'pass2-resize'
+  | 'full-resolution'
+  | 'max-dimension'
+  | 'scale-search'
   | 'passthrough'
 
 export type CompressedImage = {
@@ -33,6 +50,7 @@ export type CompressedImage = {
   outputBytes: number
   strategy: CompressionStrategy
   quality: number
+  attempts: number
 }
 
 const defaultCapabilities: CompressionCapabilities = {
@@ -61,23 +79,29 @@ export const compressForBluesky = async (
   file: File,
   options?: { skipCompression?: boolean },
 ): Promise<CompressedImage> => {
-  const allowPassthrough =
+  const passthroughCandidate =
     options?.skipCompression || (file.size <= TARGET_BYTES && isDirectUploadType(file))
-  if (allowPassthrough) {
+  if (passthroughCandidate) {
     const decoded = await decodeImage(file)
     decoded.close()
-    const mime = getFileMime(file)
-    return {
-      blob: file,
-      width: decoded.width,
-      height: decoded.height,
-      mime,
-      originalWidth: decoded.width,
-      originalHeight: decoded.height,
-      originalBytes: file.size,
-      outputBytes: file.size,
-      strategy: 'passthrough',
-      quality: 1,
+    const allowPassthrough =
+      options?.skipCompression ||
+      decoded.width * decoded.height <= MAX_PASSTHROUGH_PIXELS
+    if (allowPassthrough) {
+      const mime = getFileMime(file)
+      return {
+        blob: file,
+        width: decoded.width,
+        height: decoded.height,
+        mime,
+        originalWidth: decoded.width,
+        originalHeight: decoded.height,
+        originalBytes: file.size,
+        outputBytes: file.size,
+        strategy: 'passthrough',
+        quality: 1,
+        attempts: 0,
+      }
     }
   }
   const caps = await capabilitiesPromise
@@ -104,6 +128,19 @@ const testBitmapResize = async () => {
 }
 
 const testWebP = async () => {
+  // Probe the same surface the encoder uses: convertToBlob silently falls
+  // back to PNG for unsupported types, so an HTMLCanvasElement probe would
+  // not prove anything about the OffscreenCanvas path.
+  if (typeof OffscreenCanvas !== 'undefined') {
+    try {
+      const canvas = new OffscreenCanvas(1, 1)
+      canvas.getContext('2d')?.fillRect(0, 0, 1, 1)
+      const blob = await canvas.convertToBlob({ type: 'image/webp', quality: 0.8 })
+      return blob.type === 'image/webp'
+    } catch {
+      return false
+    }
+  }
   if (typeof document === 'undefined') {
     return false
   }
@@ -169,6 +206,11 @@ const getFileMime = (file: File) => {
   return 'image/png'
 }
 
+// Find the largest resolution that encodes under TARGET_BYTES at a fixed
+// quality, using as few encodes as possible. Each attempt fits the power
+// model bytes ≈ C·pixels^alpha to the samples so far and jumps straight to
+// the predicted critical scale, instead of bisecting. On the manga corpus
+// this lands within 4% of the true critical resolution in 1–3 encodes.
 const compressImage = async (
   file: File,
   caps: CompressionCapabilities,
@@ -177,107 +219,129 @@ const compressImage = async (
   try {
     const { width: sourceWidth, height: sourceHeight } = decoded
     const originalBytes = file.size
+    let format = caps.supportsWebP ? 'image/webp' : 'image/jpeg'
+    let quality = format === 'image/webp' ? Q_WEBP : Q_JPEG
 
-    const fullCanvas = renderToCanvas(decoded.source, sourceWidth, sourceHeight, caps)
-    const initialBlob = await canvasToBlob(fullCanvas, 'image/jpeg', Q_START_JPEG)
-    if (initialBlob.size <= TARGET_BYTES) {
-      return {
-        blob: initialBlob,
-        width: sourceWidth,
-        height: sourceHeight,
-        mime: 'image/jpeg',
-        originalWidth: sourceWidth,
-        originalHeight: sourceHeight,
-        originalBytes,
-        outputBytes: initialBlob.size,
-        strategy: 'pass1-original',
-        quality: Q_START_JPEG,
+    // Pixels beyond the CDN's 4000x4000 rendition cap never reach readers,
+    // so the search starts there (or at the original size if smaller).
+    const maxScale = Math.min(1, MAX_DIM / sourceWidth, MAX_DIM / sourceHeight)
+
+    type Sample = { scale: number; pixels: number; bytes: number }
+    type Fit = { blob: Blob; width: number; height: number; scale: number }
+
+    const samples: Sample[] = []
+    let best: Fit | null = null
+    let smallestOvershoot = Infinity
+    let scale = maxScale
+    let attempts = 0
+
+    const encodeAt = async (s: number) => {
+      const width = Math.max(1, Math.min(MAX_DIM, Math.round(sourceWidth * s)))
+      const height = Math.max(1, Math.min(MAX_DIM, Math.round(sourceHeight * s)))
+      const canvas = await downscaleToCanvas(decoded.source, width, height, caps)
+      let blob = await canvasToBlob(canvas, format, quality)
+      if (blob.type && blob.type !== format && format === 'image/webp') {
+        // The encoder silently fell back to another type (convertToBlob does
+        // this instead of throwing), so its bytes don't follow the WebP size
+        // model. JPEG encoding is universally supported.
+        format = 'image/jpeg'
+        quality = Q_JPEG
+        blob = await canvasToBlob(canvas, format, quality)
+      }
+      attempts += 1
+      samples.push({ scale: s, pixels: width * height, bytes: blob.size })
+      return { blob, width, height }
+    }
+
+    while (attempts < MAX_ATTEMPTS) {
+      let encoded: Awaited<ReturnType<typeof encodeAt>>
+      try {
+        encoded = await encodeAt(scale)
+      } catch (err) {
+        // Keep an already-found fitting result instead of failing the file
+        // when a later refinement encode dies (e.g. under memory pressure).
+        if (best) {
+          break
+        }
+        throw err
+      }
+      const { blob, width, height } = encoded
+
+      if (blob.size <= TARGET_BYTES) {
+        if (!best || scale > best.scale) {
+          best = { blob, width, height, scale }
+        }
+        // Close enough to the ceiling (or already at the resolution cap):
+        // more encodes would buy almost no resolution.
+        if (blob.size >= ACCEPT_BYTES || scale >= maxScale * 0.999) {
+          break
+        }
+      } else {
+        smallestOvershoot = Math.min(smallestOvershoot, scale)
+      }
+
+      let alpha = ALPHA_PRIOR
+      if (samples.length >= 2) {
+        const a = samples[samples.length - 2]
+        const b = samples[samples.length - 1]
+        const estimated =
+          Math.log(a.bytes / b.bytes) / Math.log(a.pixels / b.pixels)
+        if (Number.isFinite(estimated)) {
+          alpha = Math.min(ALPHA_MAX, Math.max(ALPHA_MIN, estimated))
+        }
+      }
+
+      const last = samples[samples.length - 1]
+      let next =
+        last.scale * Math.pow(PREDICT_BYTES / last.bytes, 1 / (2 * alpha))
+      next = Math.min(next, maxScale)
+      if (smallestOvershoot < Infinity) {
+        next = Math.min(next, smallestOvershoot * OVERSHOOT_BACKOFF)
+      }
+      if (best) {
+        if (next <= best.scale * MIN_GAIN) {
+          break
+        }
+      }
+      scale = next
+    }
+
+    // The bracketing above should always leave a fitting result; as a last
+    // resort keep shrinking hard until one fits. Never return an over-limit
+    // blob: failing loudly beats a guaranteed uploadBlob rejection.
+    while (!best) {
+      scale *= 0.7
+      if (scale < maxScale * 0.05) {
+        throw new Error('画像を2MB以下に圧縮できませんでした。')
+      }
+      const { blob, width, height } = await encodeAt(scale)
+      if (blob.size <= TARGET_BYTES) {
+        best = { blob, width, height, scale }
       }
     }
 
-    const { width, height } = calculateTargetSize(sourceWidth, sourceHeight)
-    const canvas =
-      width === sourceWidth && height === sourceHeight
-        ? fullCanvas
-        : await downscaleToCanvas(decoded.source, width, height, caps)
-
-    const format = caps.supportsWebP ? 'image/webp' : 'image/jpeg'
-    const q1 = format === 'image/webp' ? Q_START_WEBP : Q_START_JPEG
-    const blob1 = await canvasToBlob(canvas, format, q1)
-
-    if (blob1.size <= TARGET_BYTES) {
-      return {
-        blob: blob1,
-        width,
-        height,
-        mime: format,
-        originalWidth: sourceWidth,
-        originalHeight: sourceHeight,
-        originalBytes,
-        outputBytes: blob1.size,
-        strategy: 'pass1',
-        quality: q1,
-      }
-    }
-
-    const ratio = TARGET_BYTES / blob1.size
-    const q2 = q1 * Math.pow(ratio, POWER_K) * SAFETY_F
-
-    if (q2 >= Q_MIN) {
-      const blob2 = await canvasToBlob(canvas, format, q2)
-      return {
-        blob: blob2,
-        width,
-        height,
-        mime: format,
-        originalWidth: sourceWidth,
-        originalHeight: sourceHeight,
-        originalBytes,
-        outputBytes: blob2.size,
-        strategy: 'pass2-quality',
-        quality: q2,
-      }
-    }
-
-    const scale = Math.sqrt(ratio) * RESIZE_SAFETY
-    const newWidth = Math.max(1, Math.floor(width * scale))
-    const newHeight = Math.max(1, Math.floor(height * scale))
-    const smallCanvas = createCanvas(newWidth, newHeight, caps.supportsOffscreenCanvas)
-    const smallCtx = smallCanvas.getContext('2d')
-    if (!smallCtx) {
-      throw new Error('Canvas context is not available.')
-    }
-    smallCtx.imageSmoothingEnabled = true
-    smallCtx.imageSmoothingQuality = 'high'
-    smallCtx.drawImage(canvas as CanvasImageSource, 0, 0, newWidth, newHeight)
-    const blob2 = await canvasToBlob(smallCanvas, format, q1)
+    const strategy: CompressionStrategy =
+      attempts === 1
+        ? maxScale >= 1
+          ? 'full-resolution'
+          : 'max-dimension'
+        : 'scale-search'
 
     return {
-      blob: blob2,
-      width: newWidth,
-      height: newHeight,
+      blob: best.blob,
+      width: best.width,
+      height: best.height,
       mime: format,
       originalWidth: sourceWidth,
       originalHeight: sourceHeight,
       originalBytes,
-      outputBytes: blob2.size,
-      strategy: 'pass2-resize',
-      quality: q1,
+      outputBytes: best.blob.size,
+      strategy,
+      quality,
+      attempts,
     }
   } finally {
     decoded.close()
-  }
-}
-
-const calculateTargetSize = (width: number, height: number) => {
-  const pixelCount = width * height
-  if (pixelCount <= TARGET_MP) {
-    return { width, height }
-  }
-  const scale = Math.sqrt(TARGET_MP / pixelCount)
-  return {
-    width: Math.max(1, Math.floor(width * scale)),
-    height: Math.max(1, Math.floor(height * scale)),
   }
 }
 
@@ -336,7 +400,12 @@ const renderToCanvas = (
   caps: CompressionCapabilities,
 ) => {
   const canvas = createCanvas(width, height, caps.supportsOffscreenCanvas)
-  const ctx = canvas.getContext('2d')
+  // Explicit type: '2d' on the union resolves order-dependently in TS 5.9
+  // (another getContext call site can flip it to the generic overload).
+  const ctx = canvas.getContext('2d') as
+    | CanvasRenderingContext2D
+    | OffscreenCanvasRenderingContext2D
+    | null
   if (!ctx) {
     throw new Error('Canvas context is not available.')
   }

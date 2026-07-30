@@ -707,6 +707,11 @@ export default function CreateLink() {
     setCompressionLogs([])
   }
 
+  const handleStartNewUpload = () => {
+    handleClearFiles()
+    setUploadText('')
+  }
+
   const handleRemoveFile = (target: File) => {
     applyFiles(
       uploadFiles.filter((file) => fileKey(file) !== fileKey(target)),
@@ -1268,7 +1273,9 @@ export default function CreateLink() {
           <div className="mt-6">
             <h1 className="text-2xl font-semibold text-ink">漫画をポスト & リーダー用リンク作成</h1>
             <p className="mt-2 text-sm text-ink/60">
-              連番ファイル (例：xxxxx_001.png) を選択してください。
+              {uploadResult
+                ? 'ポストとリンク作成が完了しました。'
+                : '連番ファイル (例：xxxxx_001.png) を選択してください。'}
             </p>
 
             {(uploadError || error) && (
@@ -1290,6 +1297,18 @@ export default function CreateLink() {
               </div>
             ) : null}
 
+            {uploadResult ? (
+              <>
+                {renderResult(uploadResult, { postUrl: uploadResult.postUrl })}
+                <button
+                  type="button"
+                  onClick={handleStartNewUpload}
+                  className="mt-4 w-full rounded-2xl border border-ink/15 bg-paper/70 px-6 py-3 text-xs font-semibold uppercase tracking-[0.3em] text-ink/70 shadow-sm transition hover:bg-white"
+                >
+                  新しい漫画をポストする
+                </button>
+              </>
+            ) : (
             <form className="mt-6 space-y-4" onSubmit={handleUpload}>
               <div>
                 <div className="text-sm font-semibold text-ink/80">画像ファイル</div>
@@ -1534,10 +1553,7 @@ export default function CreateLink() {
                 </span>
               </button>
             </form>
-
-            {uploadResult
-              ? renderResult(uploadResult, { postUrl: uploadResult.postUrl })
-              : null}
+            )}
           </div>
         )}
       </div>
