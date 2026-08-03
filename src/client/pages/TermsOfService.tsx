@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import StatusScreen from '../components/StatusScreen'
 
 const CONTACT_URL = 'https://forms.gle/6HF3vh6zowttYerc8'
-const LAST_UPDATED = '2026-01-06'
+const LAST_UPDATED = '2026-08-03'
 
 export default function TermsOfService() {
   return (
@@ -44,8 +44,10 @@ export default function TermsOfService() {
           <ul className="mt-2 list-disc space-y-2 pl-5">
             <li>投稿内容の権利を有すること、または正当な許諾があること</li>
             <li>Blueskyの利用規約・ポリシーに従うこと</li>
-            <li>不正利用防止のため、必要に応じて利用制限を行うことがあること</li>
           </ul>
+          <p className="mt-2">
+            当方は、不正利用の防止のため、必要に応じて利用制限を行うことがあります。
+          </p>
         </section>
 
         <section>
@@ -72,7 +74,14 @@ export default function TermsOfService() {
         </section>
 
         <section>
-          <h2 className="text-sm font-semibold text-ink">6. お問い合わせ</h2>
+          <h2 className="text-sm font-semibold text-ink">6. 準拠法・管轄</h2>
+          <p className="mt-2">
+            本規約は日本法に準拠します。本サービスに関して紛争が生じた場合は、運営者の住所地を管轄する裁判所を専属的合意管轄裁判所とします。
+          </p>
+        </section>
+
+        <section>
+          <h2 className="text-sm font-semibold text-ink">7. お問い合わせ</h2>
           <p className="mt-2">
             ご質問は
             <a

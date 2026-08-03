@@ -56,6 +56,10 @@ const IMAGES_PER_POST = 10
 const GALLERY_MIN_IMAGES = 5
 const RETRY_LIMIT = 3
 const RETRY_BASE_MS = 700
+// Unofficial client attribution: TOKIMEKI and other clients write a plain
+// `via` string onto the post record, and clients that support it render
+// "via <name>" under the post.
+const POST_VIA = 'SkyBind'
 const PREVIEW_PAIR_COLORS = [
   '#e07a5f',
   '#81b29a',
@@ -940,6 +944,7 @@ export default function CreateLink() {
           facets,
           langs: ['ja'],
           embed,
+          via: POST_VIA,
         }
 
         if (selfLabels) {

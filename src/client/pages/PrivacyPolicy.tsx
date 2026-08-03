@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import StatusScreen from '../components/StatusScreen'
 
 const CONTACT_URL = 'https://forms.gle/6HF3vh6zowttYerc8'
-const LAST_UPDATED = '2025-12-26'
+const LAST_UPDATED = '2026-08-03'
 
 export default function PrivacyPolicy() {
   return (
@@ -55,7 +55,7 @@ export default function PrivacyPolicy() {
                 <li>作者の表示名/ハンドル/アイコン画像</li>
               </ul>
               <p className="mt-2 text-xs text-ink/60">
-                これらは表示のために取得し、サーバーには保存しません。
+                これらは表示のために取得するもので、配信高速化のための一時的なキャッシュ（最大60秒程度）を除き、サーバーには保存しません。
               </p>
             </div>
             <div>
@@ -64,6 +64,14 @@ export default function PrivacyPolicy() {
               </div>
               <p className="mt-2 text-sm text-ink/60">
                 画像と本文はブラウザからBlueskyへ直接送信され、サーバーには保存されません。
+              </p>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
+                アクセスログ
+              </div>
+              <p className="mt-2 text-sm text-ink/60">
+                サービスの提供・保守のため、IPアドレスやブラウザ情報等のアクセスログがホスティング事業者（Cloudflare）により処理されることがあります。当方がこれらを個人の特定に利用することはありません。
               </p>
             </div>
             <div>
