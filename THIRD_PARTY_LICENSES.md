@@ -13,6 +13,8 @@ and served by the site at `/THIRD_PARTY_NOTICES.txt`.
 
 - @atproto/api@0.20.11 (npm, bundled into the client) — Copyright (c) 2022-2026 Bluesky Social PBC, and Contributors
 - @atproto/oauth-client-browser@0.4.1 (npm, bundled into the client) — Copyright (c) 2022-2026 Bluesky Social PBC, and Contributors
+- @noble/curves@2.2.0 (npm, bundled into the worker) — Copyright (c) 2022 Paul Miller (https://paulmillr.com)
+- @scure/base@2.2.0 (npm, bundled into the worker) — Copyright (c) 2022 Paul Miller (https://paulmillr.com)
 - hono@4.11.1 (npm, bundled into the worker) — Copyright (c) 2021 - present, Yusuke Wada and Hono contributors
 - react@18.3.1 (npm, bundled into the client) — Copyright (c) Facebook, Inc. and its affiliates
 - react-dom@18.3.1 (npm, bundled into the client) — Copyright (c) Facebook, Inc. and its affiliates

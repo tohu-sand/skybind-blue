@@ -10,11 +10,16 @@
     "deploy": "wrangler pages deploy dist",
     "db:apply": "wrangler d1 execute skybind-db --local --file=./schema.sql",
     "db:apply:remote": "wrangler d1 execute skybind-db --remote --file=./schema.sql",
+    "test:auth": "esbuild src/server/serviceAuth.ts --bundle --format=esm --platform=neutral --external:@noble/* --external:@scure/* --outfile=.test-bundle/serviceAuth.mjs && node tests/serviceAuth.test.mjs",
+    "db:migrate": "node scripts/db-migrate.mjs",
+    "db:migrate:remote": "node scripts/db-migrate.mjs --remote",
     "db:reset:local": "wrangler d1 execute skybind-db --local --file=./reset.sql"
   },
   "dependencies": {
     "@atproto/api": "^0.20.11",
     "@atproto/oauth-client-browser": "^0.4.1",
+    "@noble/curves": "^2.2.0",
+    "@scure/base": "^2.2.0",
     "hono": "^4.6.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

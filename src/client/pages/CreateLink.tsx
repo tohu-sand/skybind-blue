@@ -8,6 +8,15 @@ import {
   useState,
 } from 'react'
 import { useNavigate } from 'react-router-dom'
+import {
+  COMIC_COLLECTION,
+  SERVICE_AUTH_AUD,
+  SERVICE_AUTH_LXM,
+  comicRecordUri,
+  parsePostUri,
+  type ComicRecord,
+  type StrongRef,
+} from '../../shared/comicRecord'
 import StatusScreen from '../components/StatusScreen'
 import { useBskyAuth } from '../hooks/useBskyAuth'
 import { compressForBluesky } from '../utils/blueskyImage'
@@ -17,6 +26,15 @@ type GenerateResponse = {
   id: string
   viewerUrl: string
   pending?: boolean
+}
+
+type GenerateApiResponse = GenerateResponse & {
+  rootUri?: string
+  rootCid?: string | null
+  posts?: StrongRef[]
+  pageCount?: number
+  sensitiveSelfLabels?: string[]
+  reused?: boolean
 }
 
 type UploadResult = GenerateResponse & {
@@ -303,6 +321,84 @@ const getFilesFromDataTransfer = async (dataTransfer: DataTransfer) => {
   return grouped.flat()
 }
 
+const MAX_TITLE_LENGTH = 100
+const RECORD_FAILURE_NOTICE =
+  'リンクは作成されましたが、Blueskyアカウントへのレコード記録に失敗しました。リンク自体は利用できます。'
+const RECORD_VERIFY_NOTICE =
+  'リンクは作成されましたが、レコードの検証が完了していません。リンク自体は利用できます。'
+const AUTH_REFRESH_MESSAGE =
+  '権限の更新が必要です。一度ログアウトして、ログインし直してください。'
+
+// Short-lived proof of account control, minted by the user's own PDS and
+// verified by the SkyBind API. Minting fails on sessions that predate the
+// rpc scope — those users must re-login.
+const getServiceAuthHeader = async (agent: Agent): Promise<string> => {
+  try {
+    const response = await agent.com.atproto.server.getServiceAuth({
+      aud: SERVICE_AUTH_AUD,
+      lxm: SERVICE_AUTH_LXM,
+    })
+    return `Bearer ${response.data.token}`
+  } catch (err) {
+    console.error('service auth minting failed', err)
+    throw new Error(AUTH_REFRESH_MESSAGE)
+  }
+}
+
+// Best-effort sidecar record in the author's own repo (rkey = root post rkey),
+// so third-party clients can look the comic up straight from the post.
+const putComicRecord = async (
+  agent: Agent,
+  did: string,
+  input: {
+    subject: StrongRef
+    url: string
+    posts?: StrongRef[]
+    title?: string
+    startSide: StartSide
+    language?: string
+    labelValues?: string[]
+    pageCount?: number
+  },
+) => {
+  const subjectPost = parsePostUri(input.subject.uri)
+  if (!subjectPost) {
+    throw new Error('subjectのURIが不正です。')
+  }
+  const record: ComicRecord = {
+    $type: COMIC_COLLECTION,
+    subject: input.subject,
+    url: input.url,
+    startSide: input.startSide,
+    createdAt: new Date().toISOString(),
+  }
+  if (input.posts?.length) {
+    record.posts = input.posts
+  }
+  if (input.title) {
+    record.title = input.title
+  }
+  if (input.language) {
+    record.language = input.language
+  }
+  if (input.pageCount) {
+    record.pageCount = input.pageCount
+  }
+  if (input.labelValues?.length) {
+    record.labels = {
+      $type: 'com.atproto.label.defs#selfLabels',
+      values: input.labelValues.map((val) => ({ val })),
+    }
+  }
+  const response = await agent.com.atproto.repo.putRecord({
+    repo: did,
+    collection: COMIC_COLLECTION,
+    rkey: subjectPost.rkey,
+    record: record as unknown as Record<string, unknown>,
+  })
+  return { uri: comicRecordUri(did, subjectPost.rkey), cid: response.data.cid }
+}
+
 const buildPostText = ({
   body,
   viewerUrl,
@@ -325,6 +421,29 @@ const buildPostText = ({
   lines.push(`(${index + 1}/${total})`)
   return lines.join('\n')
 }
+
+const TitleInput = ({
+  value,
+  onChange,
+  disabled = false,
+}: {
+  value: string
+  onChange: (value: string) => void
+  disabled?: boolean
+}) => (
+  <div>
+    <div className="text-sm font-semibold text-ink/80">作品タイトル（任意）</div>
+    <input
+      type="text"
+      value={value}
+      maxLength={MAX_TITLE_LENGTH}
+      disabled={disabled}
+      onChange={(event) => onChange(event.target.value)}
+      placeholder="未入力でも作成できます"
+      className="mt-2 w-full rounded-2xl border border-ink/10 bg-paper/80 px-4 py-3 text-sm shadow-sm focus:border-ink/40 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+    />
+  </div>
+)
 
 const StartSidePicker = ({
   value,
@@ -457,6 +576,8 @@ export default function CreateLink() {
   const navigate = useNavigate()
   const [mode, setMode] = useState<'link' | 'upload'>('link')
   const [postUrl, setPostUrl] = useState('')
+  const [comicTitle, setComicTitle] = useState('')
+  const [linkNotice, setLinkNotice] = useState<string | null>(null)
   const [startSide, setStartSide] = useState<StartSide>('right')
   const [contentRating, setContentRating] = useState<ContentRating>('all')
   const [postSplit, setPostSplit] = useState<PostSplit>('cover')
@@ -523,6 +644,7 @@ export default function CreateLink() {
 
   useEffect(() => {
     setLinkError(null)
+    setLinkNotice(null)
     setUploadError(null)
     setLinkResult(null)
     setUploadResult(null)
@@ -637,6 +759,7 @@ export default function CreateLink() {
   const handleGenerate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setLinkError(null)
+    setLinkNotice(null)
     setLinkResult(null)
 
     if (!session) {
@@ -651,25 +774,65 @@ export default function CreateLink() {
 
     setLinkLoading(true)
     try {
+      const trimmedTitle = comicTitle.trim()
+      const agent = new Agent(session)
+      const authHeader = await getServiceAuthHeader(agent)
       const response = await fetch('/api/manga/generate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Authorization: authHeader,
         },
         body: JSON.stringify({
           postUrl: postUrl.trim(),
+          title: trimmedTitle || undefined,
           startSide,
-          authorDid: session.did,
         }),
       })
 
-      const data = (await response.json()) as GenerateResponse & { error?: string }
-      if (!response.ok) {
-        const message = data.error || 'リンク作成に失敗しました。'
+      const data = (await response.json().catch(() => null)) as
+        | (GenerateApiResponse & { error?: string })
+        | null
+      if (!response.ok || !data) {
+        const message = data?.error || 'リンク作成に失敗しました。'
         throw new Error(`[${response.status}] ${message}`)
       }
 
       setLinkResult({ id: data.id, viewerUrl: data.viewerUrl })
+
+      // Best-effort: publish the comic record and let the server verify it.
+      // The link works even if this fails.
+      if (data.rootUri && data.rootCid) {
+        let record: { uri: string; cid: string } | null = null
+        try {
+          record = await withRetry(() =>
+            putComicRecord(agent, session.did, {
+              subject: { uri: data.rootUri as string, cid: data.rootCid as string },
+              url: data.viewerUrl,
+              posts: data.posts,
+              title: trimmedTitle || undefined,
+              startSide,
+              labelValues: data.sensitiveSelfLabels,
+              pageCount: data.pageCount,
+            }),
+          )
+        } catch (recordErr) {
+          console.error('comic record write failed', recordErr)
+          setLinkNotice(RECORD_FAILURE_NOTICE)
+        }
+        if (record) {
+          try {
+            await completeLink({
+              id: data.id,
+              recordUri: record.uri,
+              recordCid: record.cid,
+            })
+          } catch (verifyErr) {
+            console.error('record verification failed', verifyErr)
+            setLinkNotice(RECORD_VERIFY_NOTICE)
+          }
+        }
+      }
     } catch (err) {
       setLinkError(err instanceof Error ? err.message : 'リンク作成に失敗しました。')
     } finally {
@@ -716,36 +879,52 @@ export default function CreateLink() {
     setUploadText('')
   }
 
+  const handleStartNewLink = () => {
+    setLinkResult(null)
+    setLinkError(null)
+    setLinkNotice(null)
+    setPostUrl('')
+    setComicTitle('')
+  }
+
   const handleRemoveFile = (target: File) => {
     applyFiles(
       uploadFiles.filter((file) => fileKey(file) !== fileKey(target)),
     )
   }
 
-  const completeLink = async (id: string, postUrl: string, authorDid: string) => {
+  const completeLink = async (
+    body:
+      | { id: string; recordUri: string; recordCid?: string }
+      | { id: string; postUrl: string },
+    // Service-auth tokens are single-use, so each retry mints a fresh one.
+    mintAuthHeader?: () => Promise<string>,
+  ) => {
     const maxAttempts = 3
     let lastError: Error | null = null
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
+        const authHeader = mintAuthHeader ? await mintAuthHeader() : null
         const response = await fetch('/api/manga/complete', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            ...(authHeader ? { Authorization: authHeader } : {}),
           },
-          body: JSON.stringify({
-            id,
-            postUrl,
-            authorDid,
-          }),
+          body: JSON.stringify(body),
         })
 
-        const data = (await response.json()) as GenerateResponse & { error?: string }
-        if (response.ok) {
+        // WAF/edge errors may be HTML: never let JSON parsing swallow the
+        // HTTP status (it decides whether the attempt is retriable).
+        const data = (await response.json().catch(() => null)) as
+          | (GenerateResponse & { error?: string })
+          | null
+        if (response.ok && data) {
           return data
         }
 
-        const message = data.error || 'リンクの紐づけに失敗しました。'
+        const message = data?.error || 'リンクの紐づけに失敗しました。'
         throw Object.assign(new Error(`[${response.status}] ${message}`), {
           status: response.status,
         })
@@ -820,27 +999,31 @@ export default function CreateLink() {
     setUploading(true)
     try {
       setUploadStatus('URLを予約中...')
+      // Minting before anything is posted means a stale session fails fast,
+      // not after hundreds of image uploads.
+      const agent = new Agent(session)
+      const reserveAuthHeader = await getServiceAuthHeader(agent)
       const reserveResponse = await fetch('/api/manga/reserve', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Authorization: reserveAuthHeader,
         },
         body: JSON.stringify({
           startSide,
-          authorDid: session.did,
+          title: comicTitle.trim() || undefined,
         }),
       })
 
-      const reserveData = (await reserveResponse.json()) as GenerateResponse & {
-        error?: string
-      }
-      if (!reserveResponse.ok) {
-        const message = reserveData.error || 'URLの予約に失敗しました。'
+      const reserveData = (await reserveResponse.json().catch(() => null)) as
+        | (GenerateResponse & { error?: string })
+        | null
+      if (!reserveResponse.ok || !reserveData) {
+        const message = reserveData?.error || 'URLの予約に失敗しました。'
         throw new Error(`[${reserveResponse.status}] ${message}`)
       }
 
       const viewerUrl = reserveData.viewerUrl
-      const agent = new Agent(session)
       const selfLabels =
         contentRating === 'r18'
           ? {
@@ -850,6 +1033,8 @@ export default function CreateLink() {
           : null
       let root: { uri: string; cid: string } | null = null
       let parent: { uri: string; cid: string } | null = null
+      const postRefs: StrongRef[] = []
+      let postedImageCount = 0
       const skippedFiles: string[] = []
       // Per-file failures are skipped to keep the run going, but if every file
       // fails we need the underlying error instead of a generic message.
@@ -908,6 +1093,14 @@ export default function CreateLink() {
         }
 
         if (!images.length) {
+          // Only chunk 0's text carries the viewer URL; if it fails entirely,
+          // the next chunk would become a root post without it. Abort instead.
+          if (index === 0) {
+            throw (
+              firstUploadError ??
+              new Error('1ポスト目の画像をアップロードできませんでした。')
+            )
+          }
           advanceProgress()
           continue
         }
@@ -968,6 +1161,8 @@ export default function CreateLink() {
           root = ref
         }
         parent = ref
+        postRefs.push(ref)
+        postedImageCount += images.length
         advanceProgress()
       }
 
@@ -976,7 +1171,51 @@ export default function CreateLink() {
       }
 
       setUploadStatus('リーダーと紐づけ中...')
-      const completeResult = await completeLink(reserveData.id, root.uri, session.did)
+      // Best-effort record write, then record-verified completion. The link
+      // must still activate when either step fails.
+      let recordRef: { uri: string; cid: string } | null = null
+      try {
+        recordRef = await withRetry(() =>
+          putComicRecord(agent, session.did, {
+            subject: root as StrongRef,
+            url: viewerUrl,
+            posts: postRefs,
+            title: comicTitle.trim() || undefined,
+            startSide,
+            language: 'ja',
+            labelValues: contentRating === 'r18' ? ['porn'] : undefined,
+            pageCount: postedImageCount || undefined,
+          }),
+        )
+      } catch (recordErr) {
+        console.error('comic record write failed', recordErr)
+      }
+      let completeResult: GenerateResponse
+      let recordNotice: string | null = null
+      if (recordRef) {
+        try {
+          completeResult = await completeLink({
+            id: reserveData.id,
+            recordUri: recordRef.uri,
+            recordCid: recordRef.cid,
+          })
+        } catch (completeErr) {
+          // Record exists but verification failed: activate via legacy and
+          // surface the unverified state.
+          console.error('record-based completion failed', completeErr)
+          recordNotice = RECORD_VERIFY_NOTICE
+          completeResult = await completeLink(
+            { id: reserveData.id, postUrl: root.uri },
+            () => getServiceAuthHeader(agent),
+          )
+        }
+      } else {
+        recordNotice = RECORD_FAILURE_NOTICE
+        completeResult = await completeLink(
+          { id: reserveData.id, postUrl: root.uri },
+          () => getServiceAuthHeader(agent),
+        )
+      }
       advanceProgress()
 
       const postUrl = toBskyPostUrl(root.uri, session.did)
@@ -986,10 +1225,17 @@ export default function CreateLink() {
         pending: completeResult.pending,
         postUrl,
       })
+      const warnings: string[] = []
       if (skippedFiles.length) {
-        setUploadError(
+        warnings.push(
           `以下の画像はアップロードに失敗したためスキップされました：${skippedFiles.join('、')}`,
         )
+      }
+      if (recordNotice) {
+        warnings.push(recordNotice)
+      }
+      if (warnings.length) {
+        setUploadError(warnings.join('\n'))
       }
     } catch (err) {
       setUploadError(formatUploadError(err))
@@ -1240,7 +1486,9 @@ export default function CreateLink() {
           <div className="mt-6">
             <h1 className="text-2xl font-semibold text-ink">リーダー用リンク作成</h1>
             <p className="mt-2 text-sm text-ink/60">
-              漫画の1ページ目のポストURLを入力してください。
+              {linkResult
+                ? 'リンク作成が完了しました。'
+                : '漫画の1ページ目のポストURLを入力してください。'}
             </p>
 
             {(linkError || error) && (
@@ -1252,6 +1500,27 @@ export default function CreateLink() {
               </div>
             )}
 
+            {linkNotice ? (
+              <div
+                role="status"
+                className="mt-4 rounded-2xl border border-ink/10 bg-paper/70 px-4 py-3 text-xs text-ink/70"
+              >
+                {linkNotice}
+              </div>
+            ) : null}
+
+            {linkResult ? (
+              <>
+                {renderResult(linkResult, { share: true })}
+                <button
+                  type="button"
+                  onClick={handleStartNewLink}
+                  className="mt-4 w-full rounded-2xl border border-ink/15 bg-paper/70 px-6 py-3 text-xs font-semibold uppercase tracking-[0.3em] text-ink/70 shadow-sm transition hover:bg-white"
+                >
+                  新しいリンクを作成する
+                </button>
+              </>
+            ) : (
             <form className="mt-6 space-y-4" onSubmit={handleGenerate}>
               <input
                 type="url"
@@ -1262,6 +1531,11 @@ export default function CreateLink() {
                 className="w-full rounded-2xl border border-ink/10 bg-paper/80 px-4 py-3 text-sm shadow-sm focus:border-ink/40 focus:outline-none"
                 required
               />
+              <TitleInput
+                value={comicTitle}
+                onChange={setComicTitle}
+                disabled={linkLoading}
+              />
               <StartSidePicker value={startSide} onChange={setStartSide} />
               <button
                 type="submit"
@@ -1271,8 +1545,7 @@ export default function CreateLink() {
                 {linkLoading ? '作成中...' : 'リンク作成'}
               </button>
             </form>
-
-            {linkResult ? renderResult(linkResult, { share: true }) : null}
+            )}
           </div>
         ) : (
           <div className="mt-6">
@@ -1524,6 +1797,11 @@ export default function CreateLink() {
                   </div>
                 </div>
               </div>
+              <TitleInput
+                value={comicTitle}
+                onChange={setComicTitle}
+                disabled={uploading}
+              />
               <PostSplitPicker
                 value={postSplit}
                 onChange={setPostSplit}

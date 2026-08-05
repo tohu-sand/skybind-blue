@@ -16,6 +16,12 @@ export type MangaThreadResult = {
   originalPostUri: string
   hasSensitive: boolean
   author: AuthorProfile
+  // Chain posts in reading order (root first), for blue.skybind.comic `posts`.
+  posts: { uri: string; cid: string }[]
+  rootCid: string | null
+  // Sensitive self-label values across the WHOLE chain (a child-only R18 post
+  // must still mark the comic), for mirroring onto the record.
+  sensitiveSelfLabels: string[]
 }
 
 export type BskyClient = { service: string }
@@ -24,8 +30,9 @@ type PostLabel = { val?: string; neg?: boolean }
 
 type PostView = {
   uri: string
+  cid?: string
   author: AuthorProfile
-  record?: { createdAt?: string }
+  record?: { createdAt?: string; text?: string }
   embed?: unknown
   labels?: PostLabel[]
   indexedAt?: string
@@ -241,9 +248,12 @@ export const fetchMangaThread = async (
   uri: string,
 ): Promise<MangaThreadResult> => {
   const pages: string[] = []
+  const posts: { uri: string; cid: string }[] = []
+  const sensitiveSelfLabelSet = new Set<string>()
   const visited = new Set<string>()
   let authorDid = ''
   let author: AuthorProfile | null = null
+  let rootCid: string | null = null
   let currentUri: string | null = uri
   let steps = 0
   const maxSteps = 250
@@ -293,6 +303,17 @@ export const fetchMangaThread = async (
         visited.add(current.post.uri)
         newVisits += 1
         pages.push(...extractImages(current.post.embed))
+        if (typeof current.post.cid === 'string') {
+          posts.push({ uri: current.post.uri, cid: current.post.cid })
+        }
+        if (!rootCid && current.post.uri === uri) {
+          rootCid = current.post.cid ?? null
+        }
+        for (const val of extractSelfLabelValues(current.post.record)) {
+          if (SENSITIVE_LABELS.has(val)) {
+            sensitiveSelfLabelSet.add(val)
+          }
+        }
       }
 
       lastNode = current
@@ -333,6 +354,130 @@ export const fetchMangaThread = async (
     originalPostUri: uri,
     hasSensitive,
     author: author ?? { did: authorDid },
+    posts,
+    rootCid,
+    sensitiveSelfLabels: Array.from(sensitiveSelfLabelSet),
+  }
+}
+
+// Single-post fetch used by the /complete verification paths.
+export type PostSummary = {
+  text: string
+  cid: string | null
+  authorDid: string
+}
+
+export const fetchPostSummary = async (
+  agent: BskyClient,
+  uri: string,
+): Promise<PostSummary> => {
+  const response: { thread?: unknown } = await xrpcGet(
+    agent,
+    'app.bsky.feed.getPostThread',
+    { uri, depth: 0, parentHeight: 0 },
+  )
+  if (!isThreadViewPost(response.thread)) {
+    throw new Error('ポストが取得できませんでした。')
+  }
+  const post = response.thread.post
+  return {
+    text: post.record?.text ?? '',
+    cid: typeof post.cid === 'string' ? post.cid : null,
+    authorDid: post.author.did,
+  }
+}
+
+// --- blue.skybind.comic record verification helpers -------------------------
+// /complete proves account control by fetching the comic record from the
+// author's own PDS: only the account holder can have written it there.
+
+type DidDocument = {
+  id?: string
+  service?: { id?: string; type?: string; serviceEndpoint?: unknown }[]
+}
+
+export const resolvePdsEndpoint = async (did: string): Promise<string> => {
+  let docUrl: string
+  if (did.startsWith('did:plc:')) {
+    docUrl = `https://plc.directory/${did}`
+  } else if (did.startsWith('did:web:')) {
+    const host = did.slice('did:web:'.length)
+    // Only simple host-form did:web (no path segments) appears in practice.
+    if (!host || host.includes(':')) {
+      throw new Error('未対応のDID形式です。')
+    }
+    docUrl = `https://${decodeURIComponent(host)}/.well-known/did.json`
+  } else {
+    throw new Error('未対応のDID形式です。')
+  }
+
+  const response = await fetch(docUrl, { headers: { Accept: 'application/json' } })
+  if (!response.ok) {
+    throw new Error(`DIDの解決に失敗しました。(${response.status})`)
+  }
+  const doc = (await response.json()) as DidDocument
+  if (doc.id !== did) {
+    throw new Error('DIDドキュメントが不正です。')
+  }
+  // Per the DID spec, match the PDS service by both id and type.
+  const service = doc.service?.find(
+    (entry) =>
+      (entry?.id === '#atproto_pds' || entry?.id === `${did}#atproto_pds`) &&
+      entry?.type === 'AtprotoPersonalDataServer',
+  )
+  const endpoint = service?.serviceEndpoint
+  if (typeof endpoint !== 'string') {
+    throw new Error('PDSが見つかりませんでした。')
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(endpoint)
+  } catch {
+    throw new Error('PDSエンドポイントが不正です。')
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    (parsed.pathname !== '/' && parsed.pathname !== '')
+  ) {
+    throw new Error('PDSエンドポイントが不正です。')
+  }
+  return parsed.origin
+}
+
+export type FetchedRecord = {
+  uri: string
+  cid: string
+  value: Record<string, unknown>
+}
+
+export const fetchRepoRecord = async (
+  pds: string,
+  did: string,
+  collection: string,
+  rkey: string,
+): Promise<FetchedRecord> => {
+  const client: BskyClient = { service: pds }
+  const response = await xrpcGet<{ uri?: string; cid?: string; value?: unknown }>(
+    client,
+    'com.atproto.repo.getRecord',
+    { repo: did, collection, rkey },
+  )
+  if (
+    typeof response.uri !== 'string' ||
+    typeof response.cid !== 'string' ||
+    !response.value ||
+    typeof response.value !== 'object'
+  ) {
+    throw new Error('レコードの取得に失敗しました。')
+  }
+  return {
+    uri: response.uri,
+    cid: response.cid,
+    value: response.value as Record<string, unknown>,
   }
 }
 

@@ -27,7 +27,10 @@ MIT License
 @atproto/oauth-types 0.7.1
 @atproto/syntax 0.6.1
 @atproto/xrpc 0.8.0
+@noble/curves 2.2.0
+@noble/hashes 2.2.0
 @remix-run/router 1.23.1
+@scure/base 2.2.0
 await-lock 3.0.0
 core-js 3.49.0
 hono 4.11.1

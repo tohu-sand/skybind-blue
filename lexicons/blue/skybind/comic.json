@@ -1,0 +1,66 @@
+{
+  "lexicon": 1,
+  "id": "blue.skybind.comic",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A comic manifest presenting a Bluesky post thread as a paginated comic. The record key SHOULD equal the rkey of the subject post so that clients can look up this record directly from a post. `posts`, when present, is an ordered snapshot of the thread composition; readers may alternatively reconstruct pages by walking the self-reply chain from `subject`.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["subject", "url", "createdAt"],
+        "properties": {
+          "subject": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Strong reference to the root post (source of the first page). Expected to be authored by the same account as this record."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Canonical reader URL where this comic can be read. Clients may present this as a 'read' action."
+          },
+          "posts": {
+            "type": "array",
+            "minLength": 1,
+            "items": { "type": "ref", "ref": "com.atproto.repo.strongRef" },
+            "description": "Ordered snapshot of the posts composing this comic as of the last record update. The first item MUST equal `subject`. Readers MAY render pages directly from this list without walking the reply graph; the live self-reply chain remains the source for pages appended after the record was written. Images are always fetched from the referenced posts' embeds in listed order; they are never duplicated here."
+          },
+          "title": {
+            "type": "string",
+            "maxGraphemes": 100,
+            "maxLength": 1000,
+            "description": "Optional display title of the comic."
+          },
+          "startSide": {
+            "type": "string",
+            "maxLength": 32,
+            "knownValues": ["right", "left"],
+            "default": "right",
+            "description": "Which side the first page is placed on in two-page spread view. Distinct from reading direction."
+          },
+          "language": {
+            "type": "string",
+            "format": "language",
+            "description": "Primary language of the comic content."
+          },
+          "labels": {
+            "type": "union",
+            "refs": ["com.atproto.label.defs#selfLabels"],
+            "description": "Self labels for this comic as a whole. Labels on the referenced posts remain authoritative for the images themselves."
+          },
+          "pageCount": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Total page (image) count at the time of writing. Informational."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Client-declared timestamp when this record was created."
+          }
+        }
+      }
+    }
+  }
+}

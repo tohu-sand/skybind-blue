@@ -10,6 +10,15 @@ CREATE TABLE manga_links (
   pages_json TEXT NOT NULL,
   start_side TEXT DEFAULT 'right',
   original_post_uri TEXT NOT NULL,
-  created_at INTEGER DEFAULT (strftime('%s', 'now'))
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),
+  record_cid TEXT,
+  state TEXT NOT NULL DEFAULT 'active'
 );
 CREATE INDEX IF NOT EXISTS idx_manga_id ON manga_links(id);
+DROP TABLE IF EXISTS service_auth_jti;
+CREATE TABLE service_auth_jti (
+  jti TEXT PRIMARY KEY,
+  author_did TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_service_auth_jti_expires ON service_auth_jti(expires_at);

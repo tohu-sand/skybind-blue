@@ -39,6 +39,10 @@ https://tohu-sand.com/blog/2025-12-23/
   are compressed client-side to fit Bluesky's 2 MB blob limit.
 - An `/embed/:id` route provides a compact viewer suitable for embedding in
   external pages.
+- When a link is created, the comic's metadata is recorded in the author's own
+  Bluesky account as a public `blue.skybind.comic` record. See the
+  [integration guide](docs/integration.md) (in Japanese) for how third-party
+  clients can consume it.
 
 ## Stack
 

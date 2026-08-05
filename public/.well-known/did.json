@@ -1,0 +1,11 @@
+{
+  "@context": ["https://www.w3.org/ns/did/v1"],
+  "id": "did:web:skybind.blue",
+  "service": [
+    {
+      "id": "#skybind_api",
+      "type": "SkyBindComicLinkService",
+      "serviceEndpoint": "https://skybind.blue"
+    }
+  ]
+}

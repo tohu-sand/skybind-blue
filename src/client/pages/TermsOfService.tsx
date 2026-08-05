@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import StatusScreen from '../components/StatusScreen'
 
 const CONTACT_URL = 'https://forms.gle/6HF3vh6zowttYerc8'
-const LAST_UPDATED = '2026-08-03'
+const LAST_UPDATED = '2026-08-05'
 
 export default function TermsOfService() {
   return (
@@ -33,9 +33,12 @@ export default function TermsOfService() {
             <li>投稿者本人によるビューワー用リンクの生成</li>
             <li>Bluesky投稿の見開き表示</li>
             <li>ブラウザからBlueskyへの投稿支援</li>
+            <li>
+              Blueskyアカウントへの公開レコード（blue.skybind.comic）の記録
+            </li>
           </ul>
           <p className="mt-2 text-xs text-ink/60">
-            画像は保存せず、投稿はブラウザからBlueskyへ直接送信されます。
+            画像は保存せず、投稿とレコードはブラウザからBlueskyへ直接送信されます。詳細はプライバシーポリシーをご覧ください。
           </p>
         </section>
 

@@ -1,24 +1,27 @@
 import type { Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 
+// The caller's DID is NOT part of any payload: reserve/generate/legacy-complete
+// take it from the verified service-auth JWT, and record-complete derives it
+// from the record itself.
 type GeneratePayload = {
   postUrl: string
   title?: string
   startSide: 'right' | 'left'
-  authorDid: string
 }
 
 type ReservePayload = {
   title?: string
   startSide: 'right' | 'left'
-  authorDid: string
 }
 
-type CompletePayload = {
-  id: string
-  postUrl: string
-  authorDid: string
-}
+// New clients complete by pointing at the blue.skybind.comic record they wrote
+// (ownership proof: only the account holder can write to their own repo).
+// Legacy shape (postUrl) remains as a fallback for runs where the record
+// write failed; it requires service auth instead.
+type CompletePayload =
+  | { kind: 'record'; id: string; recordUri: string; recordCid: string }
+  | { kind: 'legacy'; id: string; postUrl: string }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
@@ -40,45 +43,38 @@ const readJsonBody = async (c: Context): Promise<Record<string, unknown>> => {
 
 const readStartSide = (value: unknown) => (value === 'left' ? 'left' : 'right')
 
+const MAX_TITLE_LENGTH = 100
+
+const readTitle = (value: unknown) =>
+  value ? String(value).trim().slice(0, MAX_TITLE_LENGTH) || undefined : undefined
+
 export async function readGeneratePayload(c: Context): Promise<GeneratePayload> {
   const body = await readJsonBody(c)
 
   const postUrl = String(body.postUrl || '').trim()
-  const authorDid = String(body.authorDid || '').trim()
-  const title = body.title ? String(body.title).trim() : undefined
+  const title = readTitle(body.title)
   const startSide = readStartSide(body.startSide)
 
   if (!postUrl) {
     throw new HTTPException(400, { message: 'postUrlが必要です。' })
   }
 
-  if (!authorDid) {
-    throw new HTTPException(401, { message: 'authorDidが必要です。' })
-  }
-
   return {
     postUrl,
     title,
     startSide,
-    authorDid,
   }
 }
 
 export async function readReservePayload(c: Context): Promise<ReservePayload> {
   const body = await readJsonBody(c)
 
-  const authorDid = String(body.authorDid || '').trim()
-  const title = body.title ? String(body.title).trim() : undefined
+  const title = readTitle(body.title)
   const startSide = readStartSide(body.startSide)
-
-  if (!authorDid) {
-    throw new HTTPException(401, { message: 'authorDidが必要です。' })
-  }
 
   return {
     title,
     startSide,
-    authorDid,
   }
 }
 
@@ -86,24 +82,26 @@ export async function readCompletePayload(c: Context): Promise<CompletePayload> 
   const body = await readJsonBody(c)
 
   const id = String(body.id || '').trim()
-  const postUrl = String(body.postUrl || '').trim()
-  const authorDid = String(body.authorDid || '').trim()
-
   if (!id) {
     throw new HTTPException(400, { message: 'idが必要です。' })
   }
 
+  const recordUri = String(body.recordUri || '').trim()
+  if (recordUri) {
+    // Required so the server can pin verification to the exact version the
+    // client wrote (TOCTOU detection).
+    const recordCid = String(body.recordCid || '').trim()
+    if (!recordCid) {
+      throw new HTTPException(400, { message: 'recordCidが必要です。' })
+    }
+    return { kind: 'record', id, recordUri, recordCid }
+  }
+
+  const postUrl = String(body.postUrl || '').trim()
+
   if (!postUrl) {
-    throw new HTTPException(400, { message: 'postUrlが必要です。' })
+    throw new HTTPException(400, { message: 'postUrlまたはrecordUriが必要です。' })
   }
 
-  if (!authorDid) {
-    throw new HTTPException(401, { message: 'authorDidが必要です。' })
-  }
-
-  return {
-    id,
-    postUrl,
-    authorDid,
-  }
+  return { kind: 'legacy', id, postUrl }
 }

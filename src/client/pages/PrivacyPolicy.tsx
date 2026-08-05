@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import StatusScreen from '../components/StatusScreen'
 
 const CONTACT_URL = 'https://forms.gle/6HF3vh6zowttYerc8'
-const LAST_UPDATED = '2026-08-03'
+const LAST_UPDATED = '2026-08-05'
 
 export default function PrivacyPolicy() {
   return (
@@ -40,10 +40,25 @@ export default function PrivacyPolicy() {
                 <li>Blueskyアカウント識別子（DID）</li>
                 <li>1ページ目のポストURLから解決した元ポストURI</li>
                 <li>開始ページの左右</li>
-                <li>生成されたリンクID、作成日時</li>
+                <li>作品タイトル（入力した場合のみ）</li>
+                <li>生成されたリンクID、作成日時、リンクの状態</li>
+                <li>下記「Blueskyアカウントに記録される情報」の識別子（CID）</li>
+                <li>
+                  リンク作成時の認証トークンの使用済み識別子（DID・有効期限と紐づく短い乱数。
+                  トークンの再利用防止のためのみに使用し、期限経過後に削除）
+                </li>
               </ul>
               <p className="mt-2 text-xs text-ink/60">
                 画像ファイル本体、画像URL一覧、投稿本文はサーバーに保存しません。
+              </p>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
+                Blueskyアカウントに記録される情報
+              </div>
+              <p className="mt-2 text-sm text-ink/60">
+                リンク作成時に、リンク情報（元ポストURL、リーダーURL、作品タイトル（入力した場合のみ）、開始ページの左右等）が、公開レコード（blue.skybind.comic）としてあなた自身のBlueskyアカウントに記録されます。これはAT
+                Protocol上の公開データであり、本サービス以外のアプリやサービスからも参照することができます。
               </p>
             </div>
             <div>
