@@ -3,6 +3,8 @@
 // that the Pages Functions bundler (wrangler 3 / esbuild) cannot parse.
 // The browser-side uploader keeps using the SDK.
 
+import { fetchDidDocument, isPublicHostname, readBodyCapped } from './did'
+
 type AuthorProfile = {
   did: string
   handle?: string
@@ -60,6 +62,16 @@ const isThreadViewPost = (value: unknown): value is ThreadViewPost => {
   )
 }
 
+// Upstream hosts include author-controlled PDSes, so responses are treated as
+// hostile: redirects are never followed (they could point at an internal
+// address), a timeout covers the body read too, and the bytes actually
+// consumed are capped.
+const XRPC_TIMEOUT_MS = 10_000
+// Public-API thread chunks are the largest legitimate payloads (deep reply
+// arrays reach a few hundred KB); 5 MB is far above that yet bounds memory.
+const XRPC_MAX_BYTES = 5 * 1024 * 1024
+const XRPC_ERROR_MAX_BYTES = 64 * 1024
+
 const xrpcGet = async <T,>(
   client: BskyClient,
   nsid: string,
@@ -69,26 +81,43 @@ const xrpcGet = async <T,>(
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, String(value))
   }
-  const response = await fetch(url.toString(), {
-    headers: { Accept: 'application/json' },
-  })
-  if (!response.ok) {
-    let body: { error?: string; message?: string } | null = null
-    try {
-      body = (await response.json()) as { error?: string; message?: string }
-    } catch {
-      // not JSON; fall through to the generic message
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), XRPC_TIMEOUT_MS)
+  try {
+    const response = await fetch(url.toString(), {
+      headers: { Accept: 'application/json' },
+      redirect: 'manual',
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      let body: { error?: string; message?: string } | null = null
+      try {
+        body = JSON.parse(
+          await readBodyCapped(
+            response,
+            controller,
+            XRPC_ERROR_MAX_BYTES,
+            '応答が大きすぎます。',
+          ),
+        ) as { error?: string; message?: string }
+      } catch {
+        // not JSON (or oversized); fall through to the generic message
+      }
+      const error = new Error(
+        body?.message || `${nsid} failed (${response.status})`,
+      ) as Error & { status?: number; error?: string }
+      error.status = response.status
+      if (body?.error) {
+        error.error = body.error
+      }
+      throw error
     }
-    const error = new Error(
-      body?.message || `${nsid} failed (${response.status})`,
-    ) as Error & { status?: number; error?: string }
-    error.status = response.status
-    if (body?.error) {
-      error.error = body.error
-    }
-    throw error
+    return JSON.parse(
+      await readBodyCapped(response, controller, XRPC_MAX_BYTES, '応答が大きすぎます。'),
+    ) as T
+  } finally {
+    clearTimeout(timer)
   }
-  return (await response.json()) as T
 }
 
 const toTimestamp = (post: {
@@ -360,6 +389,93 @@ export const fetchMangaThread = async (
   }
 }
 
+// --- pending link self-repair ------------------------------------------------
+// The uploader publishes the viewer URL in the ROOT post before the final
+// bind call, so a crashed run can leave a live published URL pointing at a
+// pending row. Everything needed to finish the bind is public: scan the row
+// author's own feed for a root post with images whose text carries the URL.
+// (Same ownership proof as legacy /complete: only the author can have posted
+// it to their own repo.)
+
+const REPAIR_FEED_PAGE_CAP = 5
+const REPAIR_SINCE_MARGIN_MS = 60 * 60 * 1000
+
+export const findPublishedLinkPost = async (
+  agent: BskyClient,
+  authorDid: string,
+  linkId: string,
+  // Reservation time: posts older than this (minus margin) cannot be the one.
+  sinceEpochSec: number | null,
+): Promise<string | null> => {
+  const needle = `/v/${linkId}`
+  const sinceMs =
+    sinceEpochSec !== null ? sinceEpochSec * 1000 - REPAIR_SINCE_MARGIN_MS : null
+  let cursor: string | undefined
+  // The upload posts the URL within minutes of the reservation, so the OLDEST
+  // qualifying post is the comic root; later shares/reposts must lose.
+  let best: { uri: string; ts: number } | null = null
+
+  for (let page = 0; page < REPAIR_FEED_PAGE_CAP; page += 1) {
+    const params: Record<string, string | number> = {
+      actor: authorDid,
+      limit: 100,
+    }
+    if (cursor) {
+      params.cursor = cursor
+    }
+    const response = await xrpcGet<{ feed?: unknown[]; cursor?: string }>(
+      agent,
+      'app.bsky.feed.getAuthorFeed',
+      params,
+    )
+    const feed = Array.isArray(response.feed) ? response.feed : []
+    if (!feed.length) {
+      break
+    }
+    let reachedOlder = false
+    for (const item of feed) {
+      const entry = item as { post?: PostView; reason?: unknown }
+      if (entry.reason || !entry.post) {
+        continue // repost of someone else's (or own) post
+      }
+      const post = entry.post
+      if (post.author?.did !== authorDid) {
+        continue
+      }
+      const record = post.record as
+        | { text?: string; createdAt?: string; reply?: unknown }
+        | undefined
+      const ts = Date.parse(record?.createdAt ?? '')
+      if (sinceMs !== null && !Number.isNaN(ts) && ts < sinceMs) {
+        reachedOlder = true
+        continue
+      }
+      if (record?.reply) {
+        continue // the URL lives in the root post only
+      }
+      if (typeof record?.text !== 'string' || !record.text.includes(needle)) {
+        continue
+      }
+      if (!extractImages(post.embed).length) {
+        continue // text-only shares of the URL are not the comic
+      }
+      const orderTs = Number.isNaN(ts) ? Number.MAX_SAFE_INTEGER : ts
+      if (!best || orderTs < best.ts) {
+        best = { uri: post.uri, ts: orderTs }
+      }
+    }
+    if (reachedOlder) {
+      break
+    }
+    cursor = response.cursor
+    if (!cursor) {
+      break
+    }
+  }
+
+  return best?.uri ?? null
+}
+
 // Single-post fetch used by the /complete verification paths.
 export type PostSummary = {
   text: string
@@ -391,34 +507,11 @@ export const fetchPostSummary = async (
 // /complete proves account control by fetching the comic record from the
 // author's own PDS: only the account holder can have written it there.
 
-type DidDocument = {
-  id?: string
-  service?: { id?: string; type?: string; serviceEndpoint?: unknown }[]
-}
-
 export const resolvePdsEndpoint = async (did: string): Promise<string> => {
-  let docUrl: string
-  if (did.startsWith('did:plc:')) {
-    docUrl = `https://plc.directory/${did}`
-  } else if (did.startsWith('did:web:')) {
-    const host = did.slice('did:web:'.length)
-    // Only simple host-form did:web (no path segments) appears in practice.
-    if (!host || host.includes(':')) {
-      throw new Error('未対応のDID形式です。')
-    }
-    docUrl = `https://${decodeURIComponent(host)}/.well-known/did.json`
-  } else {
-    throw new Error('未対応のDID形式です。')
-  }
-
-  const response = await fetch(docUrl, { headers: { Accept: 'application/json' } })
-  if (!response.ok) {
-    throw new Error(`DIDの解決に失敗しました。(${response.status})`)
-  }
-  const doc = (await response.json()) as DidDocument
-  if (doc.id !== did) {
-    throw new Error('DIDドキュメントが不正です。')
-  }
+  // The shared resolver validates the DID before any network access (SSRF),
+  // never follows redirects, bounds the fetch by timeout and size, and caches
+  // documents — so repeated /complete attempts don't re-resolve per request.
+  const { doc } = await fetchDidDocument(did)
   // Per the DID spec, match the PDS service by both id and type.
   const service = doc.service?.find(
     (entry) =>
@@ -441,7 +534,12 @@ export const resolvePdsEndpoint = async (did: string): Promise<string> => {
     parsed.password ||
     parsed.search ||
     parsed.hash ||
-    (parsed.pathname !== '/' && parsed.pathname !== '')
+    (parsed.pathname !== '/' && parsed.pathname !== '') ||
+    // The endpoint is read from an attacker-influencable document, so the
+    // host must look public: no IP literals (169.254.169.254, [::1], ...),
+    // localhost, or reserved TLDs. Explicit ports stay allowed — the atproto
+    // DID spec permits them for PDS service endpoints.
+    !isPublicHostname(parsed.hostname)
   ) {
     throw new Error('PDSエンドポイントが不正です。')
   }

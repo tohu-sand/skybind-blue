@@ -11,6 +11,7 @@
     "db:apply": "wrangler d1 execute skybind-db --local --file=./schema.sql",
     "db:apply:remote": "wrangler d1 execute skybind-db --remote --file=./schema.sql",
     "test:auth": "esbuild src/server/serviceAuth.ts --bundle --format=esm --platform=neutral --external:@noble/* --external:@scure/* --outfile=.test-bundle/serviceAuth.mjs && node tests/serviceAuth.test.mjs",
+    "test:api": "esbuild src/server/index.ts --bundle --format=esm --platform=neutral --external:@noble/* --external:@scure/* --external:hono --external:hono/* --outfile=.test-bundle/serverApi.mjs && esbuild src/server/manga.ts --bundle --format=esm --platform=neutral --outfile=.test-bundle/manga.mjs && node tests/serverApi.test.mjs",
     "db:migrate": "node scripts/db-migrate.mjs",
     "db:migrate:remote": "node scripts/db-migrate.mjs --remote",
     "db:reset:local": "wrangler d1 execute skybind-db --local --file=./reset.sql"

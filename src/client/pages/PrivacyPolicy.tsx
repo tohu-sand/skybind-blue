@@ -1,8 +1,21 @@
+import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import StatusScreen from '../components/StatusScreen'
 
 const CONTACT_URL = 'https://forms.gle/6HF3vh6zowttYerc8'
-const LAST_UPDATED = '2026-08-05'
+const LAST_UPDATED = '2026-08-06'
+
+const linkClass =
+  'underline decoration-ink/30 underline-offset-4 transition hover:text-ink hover:decoration-ink/60'
+
+// Every section is a heading + one bullet list (one item = one fact), so the
+// whole document reads in a single consistent rhythm.
+const Section = ({ title, children }: { title: string; children: ReactNode }) => (
+  <section>
+    <h2 className="text-sm font-semibold text-ink">{title}</h2>
+    <ul className="mt-2 list-disc space-y-2 pl-5">{children}</ul>
+  </section>
+)
 
 export default function PrivacyPolicy() {
   return (
@@ -29,141 +42,77 @@ export default function PrivacyPolicy() {
           SkyBind（以下「本サービス」）は、Blueskyに投稿された漫画を閲覧するために必要な情報のみを取り扱います。
         </p>
 
-        <section>
-          <h2 className="text-sm font-semibold text-ink">1. 収集する情報</h2>
-          <div className="mt-3 space-y-4">
-            <div>
-              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
-                サーバーに保存する情報
-              </div>
-              <ul className="mt-2 list-disc space-y-2 pl-5">
-                <li>Blueskyアカウント識別子（DID）</li>
-                <li>1ページ目のポストURLから解決した元ポストURI</li>
-                <li>開始ページの左右</li>
-                <li>作品タイトル（入力した場合のみ）</li>
-                <li>生成されたリンクID、作成日時、リンクの状態</li>
-                <li>下記「Blueskyアカウントに記録される情報」の識別子（CID）</li>
-                <li>
-                  リンク作成時の認証トークンの使用済み識別子（DID・有効期限と紐づく短い乱数。
-                  トークンの再利用防止のためのみに使用し、期限経過後に削除）
-                </li>
-              </ul>
-              <p className="mt-2 text-xs text-ink/60">
-                画像ファイル本体、画像URL一覧、投稿本文はサーバーに保存しません。
-              </p>
-            </div>
-            <div>
-              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
-                Blueskyアカウントに記録される情報
-              </div>
-              <p className="mt-2 text-sm text-ink/60">
-                リンク作成時に、リンク情報（元ポストURL、リーダーURL、作品タイトル（入力した場合のみ）、開始ページの左右等）が、公開レコード（blue.skybind.comic）としてあなた自身のBlueskyアカウントに記録されます。これはAT
-                Protocol上の公開データであり、本サービス以外のアプリやサービスからも参照することができます。
-              </p>
-            </div>
-            <div>
-              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
-                表示のために取得する情報
-              </div>
-              <ul className="mt-2 list-disc space-y-2 pl-5">
-                <li>Bluesky APIから取得する投稿の画像URL</li>
-                <li>作者の表示名/ハンドル/アイコン画像</li>
-              </ul>
-              <p className="mt-2 text-xs text-ink/60">
-                これらは表示のために取得するもので、配信高速化のための一時的なキャッシュ（最大60秒程度）を除き、サーバーには保存しません。
-              </p>
-            </div>
-            <div>
-              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
-                アップローダー利用時の処理
-              </div>
-              <p className="mt-2 text-sm text-ink/60">
-                画像と本文はブラウザからBlueskyへ直接送信され、サーバーには保存されません。
-              </p>
-            </div>
-            <div>
-              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
-                アクセスログ
-              </div>
-              <p className="mt-2 text-sm text-ink/60">
-                サービスの提供・保守のため、IPアドレスやブラウザ情報等のアクセスログがホスティング事業者（Cloudflare）により処理されることがあります。当方がこれらを個人の特定に利用することはありません。
-              </p>
-            </div>
-            <div>
-              <div className="text-xs uppercase tracking-[0.3em] text-ink/50">
-                ブラウザ内に保存される情報
-              </div>
-              <ul className="mt-2 list-disc space-y-2 pl-5">
-                <li>OAuthセッション情報（アクセストークン等）</li>
-              </ul>
-              <p className="mt-2 text-xs text-ink/60">
-                サーバーには送信されず、ブラウザ内にのみ保存されます。
-              </p>
-            </div>
-          </div>
-        </section>
+        <Section title="1. サーバーに保存する情報">
+          <li>Blueskyアカウント識別子（DID）</li>
+          <li>元ポストURI（1ページ目のポストURLから解決したもの）</li>
+          <li>開始ページの左右</li>
+          <li>作品タイトル（入力した場合のみ）</li>
+          <li>リンクID・作成日時・リンクの状態</li>
+          <li>公開レコード（後述）の識別子（CID）</li>
+          <li>
+            リンク操作時の認証トークンの使用済み識別子（トークンの再利用防止のためのみに使用し、期限経過後に削除）
+          </li>
+        </Section>
 
-        <section>
-          <h2 className="text-sm font-semibold text-ink">2. 利用目的</h2>
-          <ul className="mt-2 list-disc space-y-2 pl-5">
-            <li>ビューワー用URLの生成と表示</li>
-            <li>アップローダー機能による投稿支援</li>
-            <li>投稿者本人であることの確認</li>
-            <li>不正利用防止や利用制限の運用</li>
-          </ul>
-        </section>
+        <Section title="2. 利用者のBlueskyアカウントに記録される情報">
+          <li>
+            リンク作成時に、リンク情報（元ポストURL・リーダーURL・作品タイトル（入力した場合のみ）・開始ページの左右等）が、公開レコード（blue.skybind.comic）として利用者自身のBlueskyアカウントに記録されます
+          </li>
+          <li>
+            このレコードはAT
+            Protocol上の公開データであり、本サービス以外のアプリやサービスからも参照できます
+          </li>
+        </Section>
 
-        <section>
-          <h2 className="text-sm font-semibold text-ink">3. 第三者提供・外部サービス</h2>
-          <ul className="mt-2 list-disc space-y-2 pl-5">
-            <li>投稿情報の取得のためにBluesky APIを利用します。</li>
-            <li>ホスティングおよびデータベースはCloudflare Pages / D1を利用します。</li>
-            <li>お問い合わせフォームはGoogle Formsを利用します。</li>
-          </ul>
-        </section>
+        <Section title="3. ブラウザ内にのみ保存される情報">
+          <li>OAuthセッション情報（アクセストークン等）</li>
+        </Section>
 
-        <section>
-          <h2 className="text-sm font-semibold text-ink">4. 保存期間</h2>
-          <p className="mt-2">
-            生成されたリンクを提供するために必要な期間、データを保存します。削除を希望する場合はお問い合わせからご連絡ください。
-          </p>
-        </section>
+        <Section title="4. 保存せず、表示・処理のためにのみ扱う情報">
+          <li>
+            投稿の画像URL・作者の表示名/ハンドル/アイコン（表示のために都度取得。配信高速化のための一時キャッシュ（最大60秒程度）を除き保存しません）
+          </li>
+          <li>
+            アップロードする画像と本文（ブラウザからBlueskyへ直接送信され、サーバーを経由しません）
+          </li>
+          <li>
+            アクセスログ（IPアドレス・ブラウザ情報等。ホスティング事業者（Cloudflare）が処理します。）
+          </li>
+        </Section>
 
-        <section>
-          <h2 className="text-sm font-semibold text-ink">5. お問い合わせ</h2>
-          <p className="mt-2">
-            ご質問や削除依頼は
-            <a
-              href={CONTACT_URL}
-              className="mx-1 underline decoration-ink/30 underline-offset-4"
-              target="_blank"
-              rel="noreferrer"
-            >
-              お問い合わせフォーム
-            </a>
-            からご連絡ください。
-          </p>
-        </section>
+        <Section title="5. 利用目的">
+          <li>リーダー用URLの生成と表示</li>
+          <li>アップローダー機能による投稿支援</li>
+          <li>作成したリンク・レコードの管理機能の提供</li>
+          <li>投稿者本人であることの確認</li>
+          <li>不正利用防止や利用制限の運用</li>
+        </Section>
+
+        <Section title="6. 第三者提供・外部サービス">
+          <li>投稿情報の取得: Bluesky API</li>
+          <li>ホスティングおよびデータベース: Cloudflare Pages / D1</li>
+          <li>お問い合わせフォーム: Google Forms</li>
+        </Section>
+
+        <Section title="7. 保存期間と削除">
+          <li>生成されたリンクを提供するために必要な期間、データを保存します</li>
+          <li>
+            作成したリンクとレコードは、リンク管理ページから利用者自身で削除できます
+          </li>
+          <li>作成が完了しなかったリンクの情報は、一定期間の経過後に削除されることがあります</li>
+        </Section>
       </div>
 
       <div className="mt-8 flex items-center gap-2 text-xs text-ink/60">
-        <Link to="/" className="underline decoration-ink/30 underline-offset-4">
+        <Link to="/" className={linkClass}>
           トップに戻る
         </Link>
         <span className="text-ink/30">/</span>
-        <Link
-          to="/terms"
-          className="underline decoration-ink/30 underline-offset-4"
-        >
+        <Link to="/terms" className={linkClass}>
           利用規約
         </Link>
         <span className="text-ink/30">/</span>
-        <a
-          href={CONTACT_URL}
-          className="underline decoration-ink/30 underline-offset-4"
-          target="_blank"
-          rel="noreferrer"
-        >
+        <a href={CONTACT_URL} className={linkClass} target="_blank" rel="noreferrer">
           お問い合わせ
         </a>
       </div>

@@ -15,6 +15,7 @@ CREATE TABLE manga_links (
   state TEXT NOT NULL DEFAULT 'active'
 );
 CREATE INDEX IF NOT EXISTS idx_manga_id ON manga_links(id);
+CREATE INDEX IF NOT EXISTS idx_manga_author_created ON manga_links(author_did, created_at);
 DROP TABLE IF EXISTS service_auth_jti;
 CREATE TABLE service_auth_jti (
   jti TEXT PRIMARY KEY,

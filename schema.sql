@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS manga_links (
 -- SQLite DDL; use `npm run db:migrate` / `db:migrate:remote` (scripts/db-migrate.mjs)
 -- to bring an existing database up to this shape safely.
 CREATE INDEX IF NOT EXISTS idx_manga_id ON manga_links(id);
+-- Per-author scans: quota counting, existing-link reuse, and the /manage list
+-- (which also orders by created_at within the author).
+CREATE INDEX IF NOT EXISTS idx_manga_author_created ON manga_links(author_did, created_at);
 
 -- Consumed service-auth JWT nonces (replay prevention). Rows are disposable:
 -- anything past its expiry can no longer be replayed and is purged.

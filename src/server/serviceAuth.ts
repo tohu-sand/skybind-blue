@@ -15,32 +15,16 @@ import { secp256k1 } from '@noble/curves/secp256k1.js'
 import { base58 } from '@scure/base'
 import { HTTPException } from 'hono/http-exception'
 import { SERVICE_AUTH_AUD } from '../shared/comicRecord'
+import { DID_DOC_CACHE_MAX, fetchDidDocument, type DidDocument } from './did'
 
 const CLOCK_SKEW_SECONDS = 60
 // The spec recommends ~60s tokens; allow headroom for slow uploads but keep
 // stolen tokens short-lived.
 const MAX_TOKEN_LIFETIME_SECONDS = 15 * 60
-const DID_DOC_CACHE_TTL_MS = 5 * 60 * 1000
-const DID_DOC_CACHE_MAX = 100
-const DID_FETCH_TIMEOUT_MS = 5000
-const DID_DOC_MAX_BYTES = 64 * 1024
 // Retention for consumed nonces; anything older cannot be replayed because
 // its `exp` has long passed.
 const JTI_RETENTION_SECONDS = MAX_TOKEN_LIFETIME_SECONDS + CLOCK_SKEW_SECONDS
 
-type VerificationMethod = {
-  id?: string
-  type?: string
-  controller?: string
-  publicKeyMultibase?: string
-}
-
-type DidDocument = {
-  id?: string
-  verificationMethod?: VerificationMethod[]
-}
-
-const didDocCache = new Map<string, { doc: DidDocument; expires: number }>()
 // Cooldown for the key-rotation cache bypass: without it, a stream of
 // bad-signature tokens for one cached DID would trigger a forced refetch per
 // request (outbound amplification).
@@ -69,175 +53,8 @@ const decodeJsonSegment = (segment: string): Record<string, unknown> => {
   return parsed as Record<string, unknown>
 }
 
-// --- DID validation (runs BEFORE any network access) -----------------------
-// `iss` is attacker-controlled until the signature is verified, but the
-// signing key can only be fetched by resolving it. So the DID syntax and the
-// resulting host are validated up front to prevent SSRF.
-
-const PLC_DID_PATTERN = /^did:plc:[a-z2-7]{24}$/
-const WEB_DID_PATTERN = /^did:web:[a-zA-Z0-9._%-]+$/
-const HOSTNAME_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/
-
-// TLDs that atproto handles (and therefore did:web hosts) must never use:
-// https://atproto.com/specs/handle#additional-non-syntax-restrictions
-const FORBIDDEN_TLDS = new Set([
-  'alt',
-  'arpa',
-  'example',
-  'internal',
-  'invalid',
-  'local',
-  'localhost',
-  'onion',
-  'test',
-])
-
-const isForbiddenHost = (hostname: string) => {
-  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
-    return true
-  }
-  // IPv4 literal (any) and IPv6 literal (bracketed) are never valid did:web hosts.
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) {
-    return true
-  }
-  if (hostname.length > 253) {
-    return true
-  }
-  const labels = hostname.split('.')
-  if (labels.some((label) => label.length > 63)) {
-    return true
-  }
-  const tld = labels[labels.length - 1]
-  // The final label must be a real, letter-initial TLD.
-  if (FORBIDDEN_TLDS.has(tld) || !/^[a-z]/.test(tld)) {
-    return true
-  }
-  return false
-}
-
-const didToDocumentUrl = (did: string): string => {
-  // DIDs are case-sensitive identifiers; per the spec, incorrectly-cased
-  // protocol input is rejected rather than normalized.
-  if (did !== did.toLowerCase()) {
-    throw new Error('未対応のDID形式です。')
-  }
-  if (PLC_DID_PATTERN.test(did)) {
-    return `https://plc.directory/${did}`
-  }
-  if (!WEB_DID_PATTERN.test(did)) {
-    throw new Error('未対応のDID形式です。')
-  }
-  // did:web with path segments (host:path:parts) is not used by atproto PDSes.
-  const encodedHost = did.slice('did:web:'.length)
-  let host: string
-  try {
-    host = decodeURIComponent(encodedHost)
-  } catch {
-    throw new Error('未対応のDID形式です。')
-  }
-  // Percent-encoding could smuggle uppercase past the DID-level check.
-  if (host !== host.toLowerCase()) {
-    throw new Error('未対応のDID形式です。')
-  }
-  // Re-validate AFTER decoding: percent-encoding can smuggle userinfo ("@"),
-  // ports, paths, queries and fragments past the raw pattern.
-  if (!HOSTNAME_PATTERN.test(host) || isForbiddenHost(host)) {
-    throw new Error('未対応のDID形式です。')
-  }
-  const url = new URL(`https://${host}/.well-known/did.json`)
-  if (url.hostname !== host || url.port || url.username || url.password) {
-    throw new Error('未対応のDID形式です。')
-  }
-  return url.toString()
-}
-
-const fetchDidDocument = async (
-  did: string,
-  options?: { force?: boolean },
-): Promise<{ doc: DidDocument; fromCache: boolean }> => {
-  if (!options?.force) {
-    const cached = didDocCache.get(did)
-    if (cached && cached.expires > Date.now()) {
-      return { doc: cached.doc, fromCache: true }
-    }
-  }
-
-  const docUrl = didToDocumentUrl(did)
-  const controller = new AbortController()
-  // The timer must cover the BODY too: an attacker-owned did:web could send
-  // headers instantly and then drip-feed (or flood) the body.
-  const timer = setTimeout(() => controller.abort(), DID_FETCH_TIMEOUT_MS)
-  let body: string
-  try {
-    const response = await fetch(docUrl, {
-      headers: { Accept: 'application/json' },
-      // Never chase a redirect: it could point at an internal address.
-      redirect: 'manual',
-      signal: controller.signal,
-    })
-    // Early rejects must release the unread body (Workers otherwise keeps
-    // the stream and its memory alive).
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {})
-      throw new Error(`DIDの解決に失敗しました。(${response.status})`)
-    }
-    const declaredLength = Number(response.headers.get('content-length') ?? 0)
-    if (declaredLength > DID_DOC_MAX_BYTES) {
-      await response.body?.cancel().catch(() => {})
-      throw new Error('DIDドキュメントが大きすぎます。')
-    }
-    // Stream with a byte cap: content-length is attacker-declared and may be
-    // absent, so the cap must be enforced on the actual bytes.
-    if (response.body) {
-      const reader = response.body.getReader()
-      const chunks: Uint8Array[] = []
-      let total = 0
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) {
-            break
-          }
-          total += value.byteLength
-          if (total > DID_DOC_MAX_BYTES) {
-            controller.abort()
-            throw new Error('DIDドキュメントが大きすぎます。')
-          }
-          chunks.push(value)
-        }
-      } finally {
-        reader.releaseLock()
-      }
-      const merged = new Uint8Array(total)
-      let offset = 0
-      for (const chunk of chunks) {
-        merged.set(chunk, offset)
-        offset += chunk.byteLength
-      }
-      body = new TextDecoder().decode(merged)
-    } else {
-      body = await response.text()
-      if (body.length > DID_DOC_MAX_BYTES) {
-        throw new Error('DIDドキュメントが大きすぎます。')
-      }
-    }
-  } finally {
-    clearTimeout(timer)
-  }
-  const doc = JSON.parse(body) as DidDocument
-  if (doc.id !== did) {
-    throw new Error('DIDドキュメントが不正です。')
-  }
-
-  if (didDocCache.size >= DID_DOC_CACHE_MAX) {
-    const oldest = didDocCache.keys().next().value
-    if (oldest) {
-      didDocCache.delete(oldest)
-    }
-  }
-  didDocCache.set(did, { doc, expires: Date.now() + DID_DOC_CACHE_TTL_MS })
-  return { doc, fromCache: false }
-}
+// DID syntax validation, SSRF guards and the bounded document fetch live in
+// ./did (shared with the comic-record verification path).
 
 // did:key-style multibase: 'z' + base58btc(multicodec varint + compressed key)
 const parseSigningKey = (

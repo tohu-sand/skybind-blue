@@ -26,10 +26,50 @@ type CompletePayload =
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
 
+// Hard cap on the raw request body, enforced on the actual bytes BEFORE JSON
+// parsing: Cloudflare accepts request bodies up to 100MB, far above the
+// isolate memory limit, and these payloads are legitimately tiny.
+const MAX_BODY_BYTES = 16 * 1024
+
 const readJsonBody = async (c: Context): Promise<Record<string, unknown>> => {
+  const declaredLength = Number(c.req.header('content-length') ?? 0)
+  if (declaredLength > MAX_BODY_BYTES) {
+    throw new HTTPException(413, { message: 'リクエストが大きすぎます。' })
+  }
+  const stream = c.req.raw.body
+  let text = ''
+  if (stream) {
+    const reader = stream.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          break
+        }
+        total += value.byteLength
+        if (total > MAX_BODY_BYTES) {
+          await reader.cancel().catch(() => {})
+          throw new HTTPException(413, { message: 'リクエストが大きすぎます。' })
+        }
+        chunks.push(value)
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    const merged = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      merged.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    text = new TextDecoder().decode(merged)
+  }
+
   let body: unknown
   try {
-    body = await c.req.json()
+    body = JSON.parse(text)
   } catch {
     throw new HTTPException(400, { message: 'JSONの形式が正しくありません。' })
   }
@@ -78,12 +118,20 @@ export async function readReservePayload(c: Context): Promise<ReservePayload> {
   }
 }
 
+// Link ids come from generateShortId (10 base64url chars); the pattern allows
+// slack but keeps ids unusable as a memory-DoS vector (they become rate-limit
+// map keys held for the window).
+export const LINK_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
+
 export async function readCompletePayload(c: Context): Promise<CompletePayload> {
   const body = await readJsonBody(c)
 
   const id = String(body.id || '').trim()
   if (!id) {
     throw new HTTPException(400, { message: 'idが必要です。' })
+  }
+  if (!LINK_ID_PATTERN.test(id)) {
+    throw new HTTPException(400, { message: 'idが不正です。' })
   }
 
   const recordUri = String(body.recordUri || '').trim()

@@ -29,7 +29,10 @@ type AuthContextValue = {
   profile: AuthProfile | null
   status: AuthStatus
   error: string | null
-  signIn: () => Promise<void>
+  // In-app path carried through the OAuth round trip (login started from a
+  // page other than Home); null for plain logins and restored sessions.
+  postLoginPath: string | null
+  signIn: (options?: { returnTo?: string }) => Promise<void>
   signOut: () => Promise<void>
 }
 
@@ -40,6 +43,28 @@ const getEnv = (key: string, fallback: string) =>
 
 const hasOAuthParams = (params: URLSearchParams) =>
   params.has('state') && (params.has('code') || params.has('error'))
+
+// The OAuth state string round-trips through the authorization server, so
+// only accept a plain in-app path back (no scheme-relative // redirects).
+const parseReturnTo = (state: string | null | undefined): string | null => {
+  if (!state) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(state) as { returnTo?: unknown }
+    const returnTo = parsed?.returnTo
+    if (
+      typeof returnTo === 'string' &&
+      returnTo.startsWith('/') &&
+      !returnTo.startsWith('//')
+    ) {
+      return returnTo
+    }
+  } catch {
+    // Unknown state payload: ignore.
+  }
+  return null
+}
 
 const getCallbackMode = () => {
   const searchParams = new URLSearchParams(window.location.search)
@@ -59,6 +84,7 @@ export function BskyAuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<AuthProfile | null>(null)
   const [status, setStatus] = useState<AuthStatus>('loading')
   const [error, setError] = useState<string | null>(null)
+  const [postLoginPath, setPostLoginPath] = useState<string | null>(null)
 
   useEffect(() => {
     let alive = true
@@ -114,6 +140,9 @@ export function BskyAuthProvider({ children }: { children: ReactNode }) {
 
       if (result?.session) {
         setSession(result.session)
+        setPostLoginPath(
+          parseReturnTo((result as { state?: string | null }).state),
+        )
         setStatus('authenticated')
       } else {
         setStatus('anonymous')
@@ -205,13 +234,21 @@ export function BskyAuthProvider({ children }: { children: ReactNode }) {
     }
   }, [session])
 
-  const signIn = useCallback(async () => {
-    if (!client) {
-      return
-    }
-    const entryway = getEnv('VITE_BSKY_ENTRYWAY', 'https://bsky.social')
-    await client.signIn(entryway)
-  }, [client])
+  const signIn = useCallback(
+    async (options?: { returnTo?: string }) => {
+      if (!client) {
+        return
+      }
+      const entryway = getEnv('VITE_BSKY_ENTRYWAY', 'https://bsky.social')
+      await client.signIn(
+        entryway,
+        options?.returnTo
+          ? { state: JSON.stringify({ returnTo: options.returnTo }) }
+          : undefined,
+      )
+    },
+    [client],
+  )
 
   const signOut = useCallback(async () => {
     if (!client || !session) {
@@ -230,10 +267,11 @@ export function BskyAuthProvider({ children }: { children: ReactNode }) {
       profile,
       status,
       error,
+      postLoginPath,
       signIn,
       signOut,
     }),
-    [client, session, profile, status, error, signIn, signOut],
+    [client, session, profile, status, error, postLoginPath, signIn, signOut],
   )
 
   return <BskyAuthContext.Provider value={value}>{children}</BskyAuthContext.Provider>

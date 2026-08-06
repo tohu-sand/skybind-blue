@@ -7,13 +7,19 @@ import {
   parseComicRecordUri,
   parsePostUri,
 } from '../shared/comicRecord'
-import { readCompletePayload, readGeneratePayload, readReservePayload } from './auth'
+import {
+  LINK_ID_PATTERN,
+  readCompletePayload,
+  readGeneratePayload,
+  readReservePayload,
+} from './auth'
 import { purgeExpiredJti, requireServiceAuth } from './serviceAuth'
 import {
   createAgent,
   fetchMangaThread,
   fetchPostSummary,
   fetchRepoRecord,
+  findPublishedLinkPost,
   generateShortId,
   resolvePdsEndpoint,
   resolvePostUri,
@@ -33,6 +39,8 @@ type MangaRow = {
   start_side: string | null
   original_post_uri: string
   record_cid: string | null
+  // Only selected where needed (the viewer GET's self-repair path).
+  created_at?: number | null
 }
 
 type InsertLinkInput = {
@@ -53,6 +61,29 @@ const VIEWER_CACHE_SECONDS = 60
 // quota after this long, so abandoned uploads can't exhaust the limit forever.
 const PENDING_TTL_SECONDS = 24 * 60 * 60
 const COUNT_LINKS_SQL = `SELECT COUNT(1) as count FROM manga_links WHERE author_did = ? AND NOT (state = 'pending' AND created_at < (CAST(strftime('%s','now') AS INTEGER) - ${PENDING_TTL_SECONDS}))`
+// Same freshness rule embedded as an INSERT condition (binds one author_did):
+// count check and insert become a single atomic statement, so concurrent
+// requests cannot race a COUNT→INSERT window past the quota. The standalone
+// COUNT above stays only as a fast path for a friendly 429.
+const QUOTA_GUARD_SQL = `(SELECT COUNT(1) FROM manga_links WHERE author_did = ? AND NOT (state = 'pending' AND created_at < (CAST(strftime('%s','now') AS INTEGER) - ${PENDING_TTL_SECONDS}))) < ${MAX_LINKS_PER_AUTHOR}`
+const QUOTA_ERROR_MESSAGE = `リンク生成は1アカウントあたり${MAX_LINKS_PER_AUTHOR}件までです。`
+// Physical deletion waits much longer than the quota exclusion: a pending row
+// can be a half-completed upload whose viewer URL is already published in a
+// post (seen in production), and while the row exists such a link can still
+// be repaired/activated. Expired reservations stop counting against the
+// quota after PENDING_TTL_SECONDS either way, so the long grace period costs
+// nothing but a few tiny rows.
+const PENDING_PURGE_TTL_SECONDS = 180 * 24 * 60 * 60
+// Every authenticated path that touches the author's rows runs this, so
+// long-abandoned reservations cannot accumulate for authors who never open
+// /manage.
+const purgeExpiredPending = (db: D1Database, authorDid: string) =>
+  db
+    .prepare(
+      `DELETE FROM manga_links WHERE author_did = ? AND state = 'pending' AND created_at < (CAST(strftime('%s','now') AS INTEGER) - ${PENDING_PURGE_TTL_SECONDS})`,
+    )
+    .bind(authorDid)
+    .run()
 
 const toErrorMessage = (err: unknown, fallback: string) =>
   err instanceof Error && err.message ? err.message : fallback
@@ -102,9 +133,11 @@ const insertMangaLink = async (db: D1Database, input: InsertLinkInput) => {
   for (let attempt = 0; attempt < tries; attempt += 1) {
     const candidate = input.id ?? generateShortId()
     try {
-      await db
+      const result = await db
         .prepare(
-          'INSERT INTO manga_links (id, author_did, title, pages_json, start_side, original_post_uri, state) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          `INSERT INTO manga_links (id, author_did, title, pages_json, start_side, original_post_uri, state)
+           SELECT ?, ?, ?, ?, ?, ?, ?
+           WHERE ${QUOTA_GUARD_SQL}`,
         )
         .bind(
           candidate,
@@ -114,11 +147,20 @@ const insertMangaLink = async (db: D1Database, input: InsertLinkInput) => {
           input.startSide,
           input.originalPostUri,
           input.state,
+          input.authorDid,
         )
         .run()
+      // A PK collision throws (and is retried); zero changes can only mean
+      // the in-statement quota guard refused the row.
+      if (!result.meta.changes) {
+        throw new HTTPException(429, { message: QUOTA_ERROR_MESSAGE })
+      }
       insertedId = candidate
       break
     } catch (err) {
+      if (err instanceof HTTPException) {
+        throw err
+      }
       if (attempt === tries - 1) {
         throw err
       }
@@ -149,15 +191,13 @@ app.post('/api/manga/reserve', async (c) => {
   const payload = await readReservePayload(c)
 
   try {
+    await purgeExpiredPending(c.env.DB, authorDid)
     const row = (await c.env.DB.prepare(COUNT_LINKS_SQL)
       .bind(authorDid)
       .first()) as { count?: number | string } | null
     const count = Number(row?.count ?? 0)
     if (count >= MAX_LINKS_PER_AUTHOR) {
-      return c.json(
-        { error: `リンク生成は1アカウントあたり${MAX_LINKS_PER_AUTHOR}件までです。` },
-        429,
-      )
+      return c.json({ error: QUOTA_ERROR_MESSAGE }, 429)
     }
   } catch (err) {
     console.error(err)
@@ -175,6 +215,10 @@ app.post('/api/manga/reserve', async (c) => {
       state: 'pending',
     })
   } catch (err) {
+    // The atomic quota guard surfaces as a 429 HTTPException; pass it through.
+    if (err instanceof HTTPException) {
+      throw err
+    }
     console.error(err)
     return c.json({ error: 'DBへの書き込みに失敗しました。' }, 500)
   }
@@ -214,6 +258,12 @@ app.post('/api/manga/generate', async (c) => {
     thread = await fetchMangaThread(agent, postUri)
   } catch (err) {
     console.error(err)
+    if (isNotFoundError(err)) {
+      return c.json(
+        { error: '投稿が削除されたか非公開のため、レコードを作成できません。' },
+        404,
+      )
+    }
     return c.json({ error: 'スレッド取得に失敗しました。' }, 502)
   }
   if (thread.authorDid !== authorDid) {
@@ -257,15 +307,13 @@ app.post('/api/manga/generate', async (c) => {
   }
 
   try {
+    await purgeExpiredPending(c.env.DB, authorDid)
     const row = (await c.env.DB.prepare(COUNT_LINKS_SQL)
       .bind(authorDid)
       .first()) as { count?: number | string } | null
     const count = Number(row?.count ?? 0)
     if (count >= MAX_LINKS_PER_AUTHOR) {
-      return c.json(
-        { error: `リンク生成は1アカウントあたり${MAX_LINKS_PER_AUTHOR}件までです。` },
-        429,
-      )
+      return c.json({ error: QUOTA_ERROR_MESSAGE }, 429)
     }
   } catch (err) {
     console.error(err)
@@ -273,8 +321,9 @@ app.post('/api/manga/generate', async (c) => {
   }
 
   // One row per (author, thread): the sidecar record can only point at one
-  // viewer URL. The conditional INSERT is a single statement, so concurrent
-  // requests cannot both insert; the loser re-reads the winner's id.
+  // viewer URL. The conditional INSERT is a single statement (duplicate guard
+  // AND quota guard), so concurrent requests cannot both insert; the loser
+  // re-reads the winner's id.
   let insertedId = ''
   let reused = false
   try {
@@ -283,7 +332,8 @@ app.post('/api/manga/generate', async (c) => {
       const result = await c.env.DB.prepare(
         `INSERT INTO manga_links (id, author_did, title, pages_json, start_side, original_post_uri, state)
          SELECT ?, ?, ?, ?, ?, ?, 'active'
-         WHERE NOT EXISTS (SELECT 1 FROM manga_links WHERE author_did = ? AND original_post_uri = ? AND state = 'active')`,
+         WHERE NOT EXISTS (SELECT 1 FROM manga_links WHERE author_did = ? AND original_post_uri = ? AND state = 'active')
+           AND ${QUOTA_GUARD_SQL}`,
       )
         .bind(
           candidate,
@@ -294,6 +344,7 @@ app.post('/api/manga/generate', async (c) => {
           thread.originalPostUri,
           authorDid,
           thread.originalPostUri,
+          authorDid,
         )
         .run()
       if (result.meta.changes && result.meta.changes > 0) {
@@ -311,6 +362,8 @@ app.post('/api/manga/generate', async (c) => {
         reused = true
         break
       }
+      // Neither inserted nor concurrently created: the quota guard refused.
+      return c.json({ error: QUOTA_ERROR_MESSAGE }, 429)
     }
   } catch (err) {
     console.error(err)
@@ -335,6 +388,41 @@ app.post('/api/manga/generate', async (c) => {
     reused: reused || undefined,
   })
 })
+
+// /complete in record mode is deliberately callable without service auth (the
+// record itself is the ownership proof), so it needs its own brake: each
+// attempt costs the server a DID resolution plus a PDS record fetch. Fixed
+// window, per isolate (the same trust model as the in-memory DID doc cache);
+// platform-level WAF rules remain the global backstop.
+const RATE_WINDOW_MS = 60 * 1000
+const RATE_MAX_ATTEMPTS = 30
+const RATE_BUCKET_MAX = 10_000
+const rateBuckets = new Map<string, { count: number; resetAt: number }>()
+
+const isRateLimited = (key: string, maxAttempts = RATE_MAX_ATTEMPTS): boolean => {
+  const now = Date.now()
+  const bucket = rateBuckets.get(key)
+  if (bucket && bucket.resetAt > now) {
+    bucket.count += 1
+    return bucket.count > maxAttempts
+  }
+  if (rateBuckets.size >= RATE_BUCKET_MAX) {
+    for (const [k, v] of rateBuckets) {
+      if (v.resetAt <= now) {
+        rateBuckets.delete(k)
+      }
+    }
+    // Still full after purging: sacrifice the oldest window rather than grow.
+    if (rateBuckets.size >= RATE_BUCKET_MAX) {
+      const oldest = rateBuckets.keys().next().value
+      if (oldest) {
+        rateBuckets.delete(oldest)
+      }
+    }
+  }
+  rateBuckets.set(key, { count: 1, resetAt: now + RATE_WINDOW_MS })
+  return false
+}
 
 // atproto uses CIDv1 in lowercase base32 ("b..." multibase prefix).
 const isLikelyCid = (value: unknown): value is string =>
@@ -438,7 +526,25 @@ const validateComicRecord = (
 }
 
 app.post('/api/manga/complete', async (c) => {
+  // The IP bucket is counted BEFORE the body is even parsed, so malformed and
+  // oversized bodies still consume attempts; the link bucket needs the parsed
+  // (and format-validated) id.
+  const clientIp = c.req.header('CF-Connecting-IP') ?? 'unknown'
+  if (isRateLimited(`ip:${clientIp}`)) {
+    return c.json(
+      { error: '試行回数が多すぎます。しばらく待ってから再試行してください。' },
+      429,
+    )
+  }
+
   const payload = await readCompletePayload(c)
+
+  if (isRateLimited(`link:${payload.id}`)) {
+    return c.json(
+      { error: '試行回数が多すぎます。しばらく待ってから再試行してください。' },
+      429,
+    )
+  }
 
   if (!c.env.DB) {
     return c.json({ error: 'DBバインドが未設定です。' }, 500)
@@ -522,12 +628,32 @@ app.post('/api/manga/complete', async (c) => {
         : null
     const recordStartSide = record.value.startSide === 'left' ? 'left' : 'right'
 
+    // CAS on the row state read above: external fetches ran between the
+    // SELECT and this UPDATE, so a concurrent complete may have activated the
+    // link already. Without the guard the later writer could silently re-bind
+    // an active link to a different thread. record_cid is part of the
+    // condition too, so same-subject races cannot let an older record version
+    // overwrite a newer one's metadata ("IS" because the value may be NULL).
     try {
-      await c.env.DB.prepare(
-        "UPDATE manga_links SET original_post_uri = ?, record_cid = ?, state = 'active', title = ?, start_side = ? WHERE id = ?",
+      const updated = await c.env.DB.prepare(
+        "UPDATE manga_links SET original_post_uri = ?, record_cid = ?, state = 'active', title = ?, start_side = ? WHERE id = ? AND original_post_uri = ? AND record_cid IS ?",
       )
-        .bind(subjectUri, record.cid, recordTitle, recordStartSide, payload.id)
+        .bind(
+          subjectUri,
+          record.cid,
+          recordTitle,
+          recordStartSide,
+          payload.id,
+          row.original_post_uri,
+          row.record_cid,
+        )
         .run()
+      if (!updated.meta.changes) {
+        return c.json(
+          { error: '別の更新と競合しました。もう一度お試しください。' },
+          409,
+        )
+      }
     } catch (updateErr) {
       console.error(updateErr)
       return c.json({ error: 'DBの更新に失敗しました。' }, 500)
@@ -592,12 +718,20 @@ app.post('/api/manga/complete', async (c) => {
       )
     }
 
+    // Same CAS as the record path: only an actually-still-pending row may be
+    // activated; a concurrent complete losing this race gets a conflict.
     try {
-      await c.env.DB.prepare(
-        "UPDATE manga_links SET original_post_uri = ?, state = 'active' WHERE id = ?",
+      const updated = await c.env.DB.prepare(
+        "UPDATE manga_links SET original_post_uri = ?, state = 'active' WHERE id = ? AND original_post_uri = 'pending'",
       )
         .bind(postUri, payload.id)
         .run()
+      if (!updated.meta.changes) {
+        return c.json(
+          { error: '別の更新と競合しました。もう一度お試しください。' },
+          409,
+        )
+      }
     } catch (updateErr) {
       console.error(updateErr)
       return c.json({ error: 'DBの更新に失敗しました。' }, 500)
@@ -608,6 +742,61 @@ app.post('/api/manga/complete', async (c) => {
 
   return c.json({ id: payload.id, viewerUrl })
 })
+
+// Self-healing for half-completed uploads: the uploader publishes the viewer
+// URL in the root post BEFORE the final bind call, so a crashed run can leave
+// a live, published URL pointing at a pending row (observed in production).
+// The bind is finished lazily on first reader visit — the row's author and a
+// root post in that author's own repo carrying this exact URL are the same
+// ownership proof legacy /complete verifies. Tight per-link/IP limits bound
+// the upstream feed scans this unauthenticated path can trigger.
+const REPAIR_MAX_ATTEMPTS = 3
+
+const tryRepairPendingLink = async (
+  c: { env: Bindings; req: { header: (name: string) => string | undefined } },
+  row: MangaRow,
+): Promise<string | null> => {
+  const clientIp = c.req.header('CF-Connecting-IP') ?? 'unknown'
+  if (
+    isRateLimited(`repair:${row.id}`, REPAIR_MAX_ATTEMPTS) ||
+    isRateLimited(`repairip:${clientIp}`, REPAIR_MAX_ATTEMPTS)
+  ) {
+    return null
+  }
+
+  const agent = createAgent(c.env.BSKY_PUBLIC_API || 'https://public.api.bsky.app')
+  let foundUri: string | null = null
+  try {
+    foundUri = await findPublishedLinkPost(
+      agent,
+      row.author_did,
+      row.id,
+      typeof row.created_at === 'number' ? row.created_at : null,
+    )
+  } catch (err) {
+    console.error('pending repair scan failed', err)
+    return null
+  }
+  if (!foundUri || getPostAuthorDid(foundUri) !== row.author_did) {
+    return null
+  }
+
+  try {
+    // Same CAS as legacy /complete: only a still-pending row may be bound.
+    const updated = await c.env.DB.prepare(
+      "UPDATE manga_links SET original_post_uri = ?, state = 'active' WHERE id = ? AND original_post_uri = 'pending'",
+    )
+      .bind(foundUri, row.id)
+      .run()
+    if (!updated.meta.changes) {
+      return null
+    }
+  } catch (err) {
+    console.error('pending repair update failed', err)
+    return null
+  }
+  return foundUri
+}
 
 app.get('/api/manga/:id', async (c) => {
   const id = c.req.param('id')
@@ -622,7 +811,7 @@ app.get('/api/manga/:id', async (c) => {
   }
 
   const row = (await c.env.DB.prepare(
-    'SELECT id, author_did, title, start_side, original_post_uri, record_cid FROM manga_links WHERE id = ?',
+    'SELECT id, author_did, title, start_side, original_post_uri, record_cid, created_at FROM manga_links WHERE id = ?',
   )
     .bind(id)
     .first()) as MangaRow | null
@@ -632,7 +821,11 @@ app.get('/api/manga/:id', async (c) => {
   }
 
   if (row.original_post_uri === 'pending') {
-    return c.json({ error: 'このリンクはまだ作成が完了していません。' }, 404)
+    const repairedUri = await tryRepairPendingLink(c, row)
+    if (!repairedUri) {
+      return c.json({ error: 'このリンクはまだ作成が完了していません。' }, 404)
+    }
+    row.original_post_uri = repairedUri
   }
 
   const agent = createAgent(c.env.BSKY_PUBLIC_API || 'https://public.api.bsky.app')
@@ -671,6 +864,160 @@ app.get('/api/manga/:id', async (c) => {
   )
   c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()))
   return response
+})
+
+// --- Link management (the /manage page) -------------------------------------
+// Both endpoints prove account control via service auth and only ever touch
+// the caller's own rows. Record attachment/edit needs no endpoint of its own:
+// record-mode /complete already verifies and syncs an updated record.
+
+type ManagedLinkRow = {
+  id: string
+  title: string | null
+  start_side: string | null
+  original_post_uri: string
+  record_cid: string | null
+  state: string
+  created_at: number | null
+}
+
+// The quota bounds active + fresh-pending rows at 100; expired pendings are
+// purged below. The LIMIT is a belt-and-braces cap, not pagination.
+const MANAGE_LIST_LIMIT = 200
+
+app.get('/api/manage/links', async (c) => {
+  if (!c.env.DB) {
+    return c.json({ error: 'DBバインドが未設定です。' }, 500)
+  }
+  const authorDid = await requireServiceAuth(
+    c.req.header('Authorization'),
+    SERVICE_AUTH_LXM,
+    c.env.DB,
+  )
+  c.executionCtx.waitUntil(
+    purgeExpiredJti(c.env.DB).catch((err) => console.error(err)),
+  )
+
+  try {
+    // Keeps the list (and the table) bounded per author; creation paths run
+    // the same purge, so this is not the only line of defense.
+    await purgeExpiredPending(c.env.DB, authorDid)
+    const result = await c.env.DB.prepare(
+      `SELECT id, title, start_side, original_post_uri, record_cid, state, created_at FROM manga_links WHERE author_did = ? ORDER BY created_at DESC LIMIT ${MANAGE_LIST_LIMIT}`,
+    )
+      .bind(authorDid)
+      .all()
+    const baseUrl = c.env.APP_URL || 'https://skybind.blue'
+    const links = ((result.results ?? []) as ManagedLinkRow[]).map((row) => ({
+      id: row.id,
+      title: row.title ?? undefined,
+      startSide: row.start_side === 'left' ? 'left' : 'right',
+      originalPostUri: row.original_post_uri,
+      recordCid: row.record_cid ?? undefined,
+      state: row.state === 'pending' ? 'pending' : 'active',
+      createdAt: typeof row.created_at === 'number' ? row.created_at : undefined,
+      viewerUrl: new URL(`/v/${row.id}`, baseUrl).toString(),
+    }))
+    return c.json({ links })
+  } catch (err) {
+    console.error(err)
+    return c.json({ error: 'リンク一覧の取得に失敗しました。' }, 500)
+  }
+})
+
+app.delete('/api/manage/links/:id', async (c) => {
+  if (!c.env.DB) {
+    return c.json({ error: 'DBバインドが未設定です。' }, 500)
+  }
+  const authorDid = await requireServiceAuth(
+    c.req.header('Authorization'),
+    SERVICE_AUTH_LXM,
+    c.env.DB,
+  )
+  c.executionCtx.waitUntil(
+    purgeExpiredJti(c.env.DB).catch((err) => console.error(err)),
+  )
+
+  const id = c.req.param('id')
+  if (!LINK_ID_PATTERN.test(id)) {
+    return c.json({ error: 'idが不正です。' }, 400)
+  }
+
+  try {
+    // Ownership is part of the DELETE condition itself, so a foreign id is
+    // indistinguishable from a missing one.
+    const result = await c.env.DB.prepare(
+      'DELETE FROM manga_links WHERE id = ? AND author_did = ?',
+    )
+      .bind(id, authorDid)
+      .run()
+    if (!result.meta.changes) {
+      return c.json({ error: 'リンクが見つかりませんでした。' }, 404)
+    }
+  } catch (err) {
+    console.error(err)
+    return c.json({ error: 'リンクの削除に失敗しました。' }, 500)
+  }
+
+  // The viewer edge cache may keep serving the deleted link for up to its
+  // TTL; that window is accepted rather than purged here.
+  return c.json({ ok: true })
+})
+
+// Record-only detach: the client deletes the blue.skybind.comic record from
+// the author's PDS itself; this endpoint just clears the stored verification
+// so the link stops advertising a record that no longer exists.
+app.delete('/api/manage/links/:id/record', async (c) => {
+  if (!c.env.DB) {
+    return c.json({ error: 'DBバインドが未設定です。' }, 500)
+  }
+  const authorDid = await requireServiceAuth(
+    c.req.header('Authorization'),
+    SERVICE_AUTH_LXM,
+    c.env.DB,
+  )
+  c.executionCtx.waitUntil(
+    purgeExpiredJti(c.env.DB).catch((err) => console.error(err)),
+  )
+
+  const id = c.req.param('id')
+  if (!LINK_ID_PATTERN.test(id)) {
+    return c.json({ error: 'idが不正です。' }, 400)
+  }
+  // CAS: the caller states which record version it deleted. Without this, a
+  // concurrent edit that verified a NEW record cid could be silently wiped
+  // here, leaving D1 claiming "no record" while the PDS holds one.
+  const expectedCid = (c.req.query('expectedCid') ?? '').trim()
+  if (!isLikelyCid(expectedCid)) {
+    return c.json({ error: 'expectedCidが必要です。' }, 400)
+  }
+
+  try {
+    const result = await c.env.DB.prepare(
+      'UPDATE manga_links SET record_cid = NULL WHERE id = ? AND author_did = ? AND record_cid = ?',
+    )
+      .bind(id, authorDid, expectedCid)
+      .run()
+    if (!result.meta.changes) {
+      const row = (await c.env.DB.prepare(
+        'SELECT id, author_did, title, start_side, original_post_uri, record_cid FROM manga_links WHERE id = ?',
+      )
+        .bind(id)
+        .first()) as MangaRow | null
+      if (!row || row.author_did !== authorDid) {
+        return c.json({ error: 'リンクが見つかりませんでした。' }, 404)
+      }
+      return c.json(
+        { error: '別の更新と競合しました。ページを再読み込みしてください。' },
+        409,
+      )
+    }
+  } catch (err) {
+    console.error(err)
+    return c.json({ error: 'レコード情報の更新に失敗しました。' }, 500)
+  }
+
+  return c.json({ ok: true })
 })
 
 app.onError((err, c) => {

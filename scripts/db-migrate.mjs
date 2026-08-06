@@ -71,6 +71,11 @@ for (const [name, clause] of WANTED_COLUMNS) {
   console.log(`- ${name}: added`)
 }
 
+d1(
+  'CREATE INDEX IF NOT EXISTS idx_manga_author_created ON manga_links(author_did, created_at)',
+)
+console.log('- idx_manga_author_created: ensured')
+
 // The 'active' default is wrong for reserved-but-never-completed rows; fix them.
 // Idempotent: matching rows are already exactly this value after the first run.
 const fixed = d1(
