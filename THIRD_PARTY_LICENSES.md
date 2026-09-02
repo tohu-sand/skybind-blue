@@ -15,15 +15,15 @@ and served by the site at `/THIRD_PARTY_NOTICES.txt`.
 - @atproto/oauth-client-browser@0.4.1 (npm, bundled into the client) — Copyright (c) 2022-2026 Bluesky Social PBC, and Contributors
 - @noble/curves@2.2.0 (npm, bundled into the worker) — Copyright (c) 2022 Paul Miller (https://paulmillr.com)
 - @scure/base@2.2.0 (npm, bundled into the worker) — Copyright (c) 2022 Paul Miller (https://paulmillr.com)
-- hono@4.11.1 (npm, bundled into the worker) — Copyright (c) 2021 - present, Yusuke Wada and Hono contributors
+- hono@4.13.5 (npm, bundled into the worker) — Copyright (c) 2021 - present, Yusuke Wada and Hono contributors
 - react@18.3.1 (npm, bundled into the client) — Copyright (c) Facebook, Inc. and its affiliates
 - react-dom@18.3.1 (npm, bundled into the client) — Copyright (c) Facebook, Inc. and its affiliates
-- react-router-dom@6.30.2 (npm, bundled into the client) — Copyright (c) React Training LLC 2015-2019, Copyright (c) Remix Software Inc. 2020-2021, Copyright (c) Shopify Inc. 2022-2023
+- react-router-dom@6.30.6 (npm, bundled into the client) — Copyright (c) React Training LLC 2015-2019, Copyright (c) Remix Software Inc. 2020-2021, Copyright (c) Shopify Inc. 2022-2023
 
 ### OFL-1.1
 
-- IBM Plex Sans (loaded at runtime from Google Fonts) — Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"
-- Zen Kaku Gothic Antique (loaded at runtime from Google Fonts) — Copyright 2021 The Zen Project Authors
+- @fontsource/ibm-plex-sans@5.3.0 (npm, IBM Plex Sans webfonts bundled into the client) — Copyright 2019 IBM Corp. All rights reserved. Reserved Font Name "Plex"
+- @fontsource/zen-kaku-gothic-antique@5.3.0 (npm, Zen Kaku Gothic Antique webfonts bundled into the client) — Copyright 2022 The Zen Project Authors (https://github.com/googlefonts/zen-kakugothic)
 
 ## License Texts
 
@@ -53,8 +53,8 @@ SOFTWARE.
 
 ### OFL-1.1
 
-The webfonts are not distributed with this repository; the site links to them
-at runtime via Google Fonts. Both families are licensed under the SIL Open
-Font License, Version 1.1. The full license text is available at
-https://openfontlicense.org/open-font-license-official-text/ and from each
-family's page on Google Fonts.
+The webfont files are not stored in this repository; they come from the
+`@fontsource` packages above and are self-hosted by the built site. Both
+families are licensed under the SIL Open Font License, Version 1.1, whose full
+text is reproduced in `public/THIRD_PARTY_NOTICES.txt` and also available at
+https://openfontlicense.org/open-font-license-official-text/.

@@ -64,6 +64,12 @@ type CompressionLog = {
   quality: number
 }
 
+type TimingEntry = {
+  label: string
+  ms: number
+  count: number
+}
+
 // Must match the length of real viewer URLs (generateShortId() returns 10 chars)
 // so the pre-upload grapheme check agrees with the text actually posted.
 const PREVIEW_VIEWER_URL = 'https://skybind.blue/v/xxxxxxxxxx'
@@ -469,6 +475,7 @@ export default function CreateLink() {
   const [debugSkipCompression, setDebugSkipCompression] = useState(false)
   const [compressionLogs, setCompressionLogs] = useState<CompressionLog[]>([])
   const [debugUploadMs, setDebugUploadMs] = useState<number | null>(null)
+  const [debugTimings, setDebugTimings] = useState<TimingEntry[]>([])
   const uploadTimerRef = useRef<number | null>(null)
   const copyTimerRef = useRef<number | null>(null)
   const [copyFeedback, setCopyFeedback] = useState<{ key: string; ok: boolean } | null>(
@@ -546,6 +553,7 @@ export default function CreateLink() {
       setCompressionLogs([])
       setDebugSkipCompression(false)
       setDebugUploadMs(null)
+      setDebugTimings([])
       uploadTimerRef.current = null
       setUploadProgress(null)
     }
@@ -801,9 +809,28 @@ export default function CreateLink() {
 
     const debugEnabled = debugMode
     const skipCompression = debugEnabled && debugSkipCompression
+    // Per-phase wall-clock accumulator for the debug panel. Phases repeat
+    // (one compression per image, one post per chunk), so entries aggregate
+    // total ms and call count per label.
+    const timings = new Map<string, { ms: number; count: number }>()
+    const timed = async <T,>(label: string, task: () => Promise<T>): Promise<T> => {
+      if (!debugEnabled) {
+        return task()
+      }
+      const start = performance.now()
+      try {
+        return await task()
+      } finally {
+        const entry = timings.get(label) ?? { ms: 0, count: 0 }
+        entry.ms += performance.now() - start
+        entry.count += 1
+        timings.set(label, entry)
+      }
+    }
     if (debugEnabled) {
       setCompressionLogs([])
       setDebugUploadMs(null)
+      setDebugTimings([])
       uploadTimerRef.current = performance.now()
     }
 
@@ -822,22 +849,26 @@ export default function CreateLink() {
       // Minting before anything is posted means a stale session fails fast,
       // not after hundreds of image uploads.
       const agent = new Agent(session)
-      const reserveAuthHeader = await getServiceAuthHeader(agent)
-      const reserveResponse = await fetch('/api/manga/reserve', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: reserveAuthHeader,
-        },
-        body: JSON.stringify({
-          startSide,
-          title: comicTitle.trim() || undefined,
-        }),
+      const reserveAuthHeader = await timed('認証トークン取得', () =>
+        getServiceAuthHeader(agent),
+      )
+      const { reserveResponse, reserveData } = await timed('URL予約', async () => {
+        const response = await fetch('/api/manga/reserve', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: reserveAuthHeader,
+          },
+          body: JSON.stringify({
+            startSide,
+            title: comicTitle.trim() || undefined,
+          }),
+        })
+        const data = (await response.json().catch(() => null)) as
+          | (GenerateResponse & { error?: string })
+          | null
+        return { reserveResponse: response, reserveData: data }
       })
-
-      const reserveData = (await reserveResponse.json().catch(() => null)) as
-        | (GenerateResponse & { error?: string })
-        | null
       if (!reserveResponse.ok || !reserveData) {
         const message = reserveData?.error || 'URLの予約に失敗しました。'
         throw new Error(`[${reserveResponse.status}] ${message}`)
@@ -867,15 +898,19 @@ export default function CreateLink() {
         const images = []
         for (const file of chunk) {
           try {
-            const compressed = await compressForBluesky(file, { skipCompression })
+            const compressed = await timed('画像圧縮', () =>
+              compressForBluesky(file, { skipCompression }),
+            )
             const encoding = compressed.blob.type || compressed.mime
-            const blob = await withRetry(
-              () => agent.uploadBlob(compressed.blob, { encoding }),
-              (attempt) => {
-                setUploadStatus(
-                  `ポスト中 ${index + 1}/${chunks.length} (再試行 ${attempt}/${RETRY_LIMIT})`,
-                )
-              },
+            const blob = await timed('画像アップロード', () =>
+              withRetry(
+                () => agent.uploadBlob(compressed.blob, { encoding }),
+                (attempt) => {
+                  setUploadStatus(
+                    `ポスト中 ${index + 1}/${chunks.length} (再試行 ${attempt}/${RETRY_LIMIT})`,
+                  )
+                },
+              ),
             )
             images.push({
               image: blob.data.blob,
@@ -932,7 +967,7 @@ export default function CreateLink() {
           total: chunks.length,
         })
         const richText = new RichText({ text })
-        await richText.detectFacets(agent)
+        await timed('テキスト解析', () => richText.detectFacets(agent))
         const facets =
           richText.facets && richText.facets.length ? richText.facets : undefined
 
@@ -968,13 +1003,15 @@ export default function CreateLink() {
           record.reply = { root, parent }
         }
 
-        const response = await withRetry(
-          () => agent.post(record),
-          (attempt) => {
-            setUploadStatus(
-              `ポスト中 ${index + 1}/${chunks.length} (再試行 ${attempt}/${RETRY_LIMIT})`,
-            )
-          },
+        const response = await timed('ポスト作成', () =>
+          withRetry(
+            () => agent.post(record),
+            (attempt) => {
+              setUploadStatus(
+                `ポスト中 ${index + 1}/${chunks.length} (再試行 ${attempt}/${RETRY_LIMIT})`,
+              )
+            },
+          ),
         )
         const ref = { uri: response.uri, cid: response.cid }
         if (!root) {
@@ -989,23 +1026,26 @@ export default function CreateLink() {
       if (!root) {
         throw firstUploadError ?? new Error('ポストに失敗しました。')
       }
+      const rootRef: StrongRef = root
 
       setUploadStatus('リーダーと紐づけ中...')
       // Best-effort record write, then record-verified completion. The link
       // must still activate when either step fails.
       let recordRef: { uri: string; cid: string } | null = null
       try {
-        recordRef = await withRetry(() =>
-          putComicRecord(agent, session.did, {
-            subject: root as StrongRef,
-            url: viewerUrl,
-            posts: postRefs,
-            title: comicTitle.trim() || undefined,
-            startSide,
-            language: 'ja',
-            labelValues: contentRating === 'r18' ? ['porn'] : undefined,
-            pageCount: postedImageCount || undefined,
-          }),
+        recordRef = await timed('レコード作成', () =>
+          withRetry(() =>
+            putComicRecord(agent, session.did, {
+              subject: rootRef,
+              url: viewerUrl,
+              posts: postRefs,
+              title: comicTitle.trim() || undefined,
+              startSide,
+              language: 'ja',
+              labelValues: contentRating === 'r18' ? ['porn'] : undefined,
+              pageCount: postedImageCount || undefined,
+            }),
+          ),
         )
       } catch (recordErr) {
         console.error('comic record write failed', recordErr)
@@ -1013,27 +1053,34 @@ export default function CreateLink() {
       let completeResult: GenerateResponse
       let recordNotice: string | null = null
       if (recordRef) {
+        const verifiedRef = recordRef
         try {
-          completeResult = await completeLink({
-            id: reserveData.id,
-            recordUri: recordRef.uri,
-            recordCid: recordRef.cid,
-          })
+          completeResult = await timed('リンク紐づけ', () =>
+            completeLink({
+              id: reserveData.id,
+              recordUri: verifiedRef.uri,
+              recordCid: verifiedRef.cid,
+            }),
+          )
         } catch (completeErr) {
           // Record exists but verification failed: activate via legacy and
           // surface the unverified state.
           console.error('record-based completion failed', completeErr)
           recordNotice = RECORD_VERIFY_NOTICE
-          completeResult = await completeLink(
-            { id: reserveData.id, postUrl: root.uri },
-            () => getServiceAuthHeader(agent),
+          completeResult = await timed('リンク紐づけ', () =>
+            completeLink(
+              { id: reserveData.id, postUrl: rootRef.uri },
+              () => getServiceAuthHeader(agent),
+            ),
           )
         }
       } else {
         recordNotice = RECORD_FAILURE_NOTICE
-        completeResult = await completeLink(
-          { id: reserveData.id, postUrl: root.uri },
-          () => getServiceAuthHeader(agent),
+        completeResult = await timed('リンク紐づけ', () =>
+          completeLink(
+            { id: reserveData.id, postUrl: rootRef.uri },
+            () => getServiceAuthHeader(agent),
+          ),
         )
       }
       advanceProgress()
@@ -1063,6 +1110,13 @@ export default function CreateLink() {
       if (debugEnabled && uploadTimerRef.current !== null) {
         setDebugUploadMs(Math.round(performance.now() - uploadTimerRef.current))
         uploadTimerRef.current = null
+        setDebugTimings(
+          Array.from(timings, ([label, entry]) => ({
+            label,
+            ms: entry.ms,
+            count: entry.count,
+          })),
+        )
       }
       setUploading(false)
       setUploadStatus(null)
@@ -1102,6 +1156,53 @@ export default function CreateLink() {
       url,
     )}`
     window.open(shareUrl, 'skybind-share', 'width=600,height=700,menubar=no,toolbar=no')
+  }
+
+  const renderDebugTimings = () => {
+    const totalLine = (
+      <div className="mt-2 text-[11px] text-ink/60">
+        ポスト時間:{' '}
+        {uploading && uploadTimerRef.current !== null
+          ? '計測中...'
+          : debugUploadMs !== null
+            ? `${(debugUploadMs / 1000).toFixed(2)}s`
+            : '未計測'}
+      </div>
+    )
+    if (debugUploadMs === null || !debugTimings.length) {
+      return totalLine
+    }
+    const measuredMs = debugTimings.reduce((acc, entry) => acc + entry.ms, 0)
+    const otherMs = Math.max(0, debugUploadMs - measuredMs)
+    const rows =
+      otherMs >= 1
+        ? [...debugTimings, { label: 'その他', ms: otherMs, count: 1 }]
+        : debugTimings
+    return (
+      <>
+        {totalLine}
+        <div className="mt-2 space-y-1 border-t border-ink/10 pt-2">
+          {rows.map((entry) => (
+            <div
+              key={entry.label}
+              className="flex items-center justify-between gap-3 text-[11px] text-ink/60"
+            >
+              <span>
+                {entry.label}
+                {entry.count > 1 ? (
+                  <span className="ml-1 text-[10px] text-ink/40">×{entry.count}</span>
+                ) : null}
+              </span>
+              <span className="tabular-nums">
+                {(entry.ms / 1000).toFixed(2)}s (
+                {debugUploadMs > 0 ? Math.round((entry.ms / debugUploadMs) * 100) : 0}
+                %)
+              </span>
+            </div>
+          ))}
+        </div>
+      </>
+    )
   }
 
   const renderResult = (
@@ -1401,6 +1502,14 @@ export default function CreateLink() {
             {uploadResult ? (
               <>
                 {renderResult(uploadResult, { postUrl: uploadResult.postUrl })}
+                {debugMode ? (
+                  <div className="mt-4 rounded-2xl border border-ink/10 bg-white/70 px-4 py-3 text-xs text-ink/70">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.3em] text-ink/50">
+                      Timing Debug
+                    </div>
+                    {renderDebugTimings()}
+                  </div>
+                ) : null}
                 <button
                   type="button"
                   onClick={handleStartNewUpload}
@@ -1552,14 +1661,7 @@ export default function CreateLink() {
                         {debugSkipCompression ? '圧縮: OFF' : '圧縮: ON'}
                       </button>
                     </div>
-                    <div className="mt-2 text-[11px] text-ink/60">
-                      ポスト時間:{' '}
-                      {uploading && uploadTimerRef.current !== null
-                        ? '計測中...'
-                        : debugUploadMs !== null
-                          ? `${(debugUploadMs / 1000).toFixed(2)}s`
-                          : '未計測'}
-                    </div>
+                    {renderDebugTimings()}
                     {compressionLogs.length ? (
                       <div className="mt-2 space-y-2">
                         {compressionLogs.map((log, index) => (
