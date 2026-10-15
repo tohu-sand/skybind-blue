@@ -46,9 +46,6 @@ type Feedback = {
   text: string
 }
 
-// Live PDS check shown in the delete confirmation: D1's record_cid can be
-// stale in both directions, so what actually gets deleted is verified
-// against the repo itself before the user commits.
 type RecordCheckStatus = 'checking' | 'exists' | 'none' | 'unknown'
 
 const MAX_TITLE_LENGTH = 100
@@ -56,7 +53,7 @@ const MAX_TITLE_LENGTH = 100
 const PUBLIC_API =
   (import.meta.env.VITE_BSKY_PUBLIC_API as string | undefined) ??
   'https://public.api.bsky.app'
-// app.bsky.feed.getPosts accepts at most 25 uris per call.
+// app.bsky.feed.getPosts accepts at most 25 URIs per call.
 const GET_POSTS_BATCH = 25
 
 type EmbedImageView = { thumb?: string; thumbnail?: string; fullsize?: string }
@@ -67,8 +64,6 @@ type EmbedView = {
   media?: EmbedView
 }
 
-// First page image of a post view; handles both embed generations
-// (images grid / gallery carousel) plus recordWithMedia nesting.
 const firstImageFromEmbed = (embed: EmbedView | undefined): string | null => {
   if (!embed || typeof embed.$type !== 'string') {
     return null
@@ -115,10 +110,8 @@ export default function ManageLinks() {
     id: string
     status: RecordCheckStatus
   } | null>(null)
-  // Set when the PDS-side record delete failed: unlocks "link only" deletion
-  // so a broken/unreachable PDS can never leave the row stuck in D1.
+  // Allow link-only deletion when the PDS record cannot be deleted.
   const [recordDeleteFailedId, setRecordDeleteFailedId] = useState<string | null>(null)
-  // In-panel confirmation for record-only deletion (the link stays).
   const [recordDeleteConfirming, setRecordDeleteConfirming] = useState(false)
 
   const rawHandle = profile?.handle?.toLowerCase()
@@ -157,10 +150,8 @@ export default function ManageLinks() {
     }
   }, [session, fetchLinks])
 
-  // Best-effort first-page thumbnails, straight from the public API in
-  // batches. Attempted uris are remembered so deleted/private posts don't
-  // trigger endless refetches.
   const [thumbs, setThumbs] = useState<Record<string, string>>({})
+  // Remember misses so unavailable posts do not trigger repeated requests.
   const attemptedThumbs = useRef<Set<string>>(new Set())
 
   useEffect(() => {
@@ -199,7 +190,7 @@ export default function ManageLinks() {
             }
           }
         } catch {
-          // Thumbnails are decoration; the list works without them.
+          // Thumbnail failures must not prevent link management.
         }
       }
       if (alive && Object.keys(found).length) {
@@ -239,6 +230,7 @@ export default function ManageLinks() {
       setRecordCheck({ id: link.id, status: 'none' })
       return
     }
+    // Check the PDS before confirming deletion; D1's record CID may be stale.
     setRecordCheck({ id: link.id, status: 'checking' })
     const agent = new Agent(session)
     agent.com.atproto.repo
@@ -261,9 +253,6 @@ export default function ManageLinks() {
       })
   }
 
-  // Features 2 & 3 share one flow: refresh the thread facts, rewrite the
-  // record with the edited metadata, then let record-mode /complete verify it
-  // and sync D1 (title, start_side, record_cid).
   const saveRecord = async (link: ManagedLink) => {
     if (!session) {
       return
@@ -298,8 +287,7 @@ export default function ManageLinks() {
         throw new Error('リンクとスレッドの対応が確認できませんでした。')
       }
 
-      // Keep fields the form doesn't manage (language, original createdAt)
-      // from the existing record, if one is there.
+      // Preserve fields that the form does not manage.
       let language: string | undefined
       let createdAt: string | undefined
       const rkey = parsePostUri(data.rootUri)?.rkey
@@ -321,7 +309,7 @@ export default function ManageLinks() {
             createdAt = value.createdAt
           }
         } catch {
-          // No existing record (or unreadable): write a fresh one.
+          // Missing or unreadable records use the defaults for a new record.
         }
       }
 
@@ -341,6 +329,7 @@ export default function ManageLinks() {
       )
 
       setBusyLabel('レコードを検証中...')
+      // D1 metadata is updated only after the server verifies the public record.
       await completeLink({
         id: link.id,
         recordUri: record.uri,
@@ -375,11 +364,8 @@ export default function ManageLinks() {
     }
   }
 
-  // Record-only deletion: removes the PDS record, keeps the link working.
-  // Record first, D1 second, same rationale as deleteLink — a failed detach
-  // stays visible ("レコードあり") and can simply be retried. Both steps are
-  // compare-and-swap on the record version this page loaded (swapRecord on
-  // the PDS, expectedCid in D1), so a concurrent edit can never be wiped.
+  // Delete from the PDS before clearing D1 so failures remain visible and retryable.
+  // Both operations compare CIDs to preserve concurrent edits.
   const deleteRecordOnly = async (link: ManagedLink) => {
     if (!session || !link.recordCid) {
       return
@@ -463,10 +449,7 @@ export default function ManageLinks() {
     try {
       const agent = new Agent(session)
 
-      // Record first, row second: if the record delete fails the link keeps
-      // working and stays listed, so the user can simply retry. The reverse
-      // order could leave a public record pointing at a dead URL with no UI
-      // left to clean it up.
+      // Delete the record first to avoid leaving it pointing at a deleted link.
       if (!options?.skipRecord) {
         const rkey = parsePostUri(link.originalPostUri)?.rkey
         if (rkey) {

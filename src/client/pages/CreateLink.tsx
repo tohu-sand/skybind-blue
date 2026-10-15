@@ -1,14 +1,14 @@
 import { Agent, RichText } from '@atproto/api'
 import {
-  type ChangeEvent,
-  type FormEvent,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
+  type FormEvent,
 } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { type StrongRef } from '../../shared/comicRecord'
+import type { StrongRef } from '../../shared/comicRecord'
 import ManageGearLink from '../components/ManageGearLink'
 import StatusScreen from '../components/StatusScreen'
 import { useBskyAuth } from '../hooks/useBskyAuth'
@@ -70,18 +70,14 @@ type TimingEntry = {
   count: number
 }
 
-// Must match the length of real viewer URLs (generateShortId() returns 10 chars)
-// so the pre-upload grapheme check agrees with the text actually posted.
+// Match the 10-character link ID so the preview's grapheme count is accurate.
 const PREVIEW_VIEWER_URL = 'https://skybind.blue/v/xxxxxxxxxx'
 const MAX_UPLOAD_FILES = 500
-// The gallery lexicon schema allows up to 20 items, but clients are expected
-// to enforce a soft limit of 10 in authoring UIs.
+// Gallery authoring uses a soft limit of 10; the schema permits 20.
 const IMAGES_PER_POST = 10
-// Posts with up to 4 images keep the legacy grid embed; 5+ use the carousel.
+// The images embed supports at most 4 images.
 const GALLERY_MIN_IMAGES = 5
-// Unofficial client attribution: TOKIMEKI and other clients write a plain
-// `via` string onto the post record, and clients that support it render
-// "via <name>" under the post.
+// `via` is an unofficial attribution field supported by some Bluesky clients.
 const POST_VIA = 'SkyBind'
 const PREVIEW_PAIR_COLORS = [
   '#e07a5f',
@@ -534,8 +530,7 @@ export default function CreateLink() {
     setEmbedOpen(false)
   }, [linkResult?.id, uploadResult?.id])
 
-  // Leaving mid-upload publishes a truncated thread with a dead viewer URL,
-  // so ask for confirmation while a posting run is in flight.
+  // Leaving mid-upload can interrupt the thread before the link is activated.
   useEffect(() => {
     if (!uploading) {
       return
@@ -679,8 +674,7 @@ export default function CreateLink() {
 
       setLinkResult({ id: data.id, viewerUrl: data.viewerUrl })
 
-      // Best-effort: publish the comic record and let the server verify it.
-      // The link works even if this fails.
+      // Record publication and verification must not invalidate the created link.
       if (data.rootUri && data.rootCid) {
         let record: { uri: string; cid: string } | null = null
         try {
@@ -809,9 +803,6 @@ export default function CreateLink() {
 
     const debugEnabled = debugMode
     const skipCompression = debugEnabled && debugSkipCompression
-    // Per-phase wall-clock accumulator for the debug panel. Phases repeat
-    // (one compression per image, one post per chunk), so entries aggregate
-    // total ms and call count per label.
     const timings = new Map<string, { ms: number; count: number }>()
     const timed = async <T,>(label: string, task: () => Promise<T>): Promise<T> => {
       if (!debugEnabled) {
@@ -846,8 +837,7 @@ export default function CreateLink() {
     setUploading(true)
     try {
       setUploadStatus('URLを予約中...')
-      // Minting before anything is posted means a stale session fails fast,
-      // not after hundreds of image uploads.
+      // Check authentication before uploading any images.
       const agent = new Agent(session)
       const reserveAuthHeader = await timed('認証トークン取得', () =>
         getServiceAuthHeader(agent),
@@ -887,8 +877,7 @@ export default function CreateLink() {
       const postRefs: StrongRef[] = []
       let postedImageCount = 0
       const skippedFiles: string[] = []
-      // Per-file failures are skipped to keep the run going, but if every file
-      // fails we need the underlying error instead of a generic message.
+      // Preserve the underlying error if every image upload fails.
       let firstUploadError: unknown = null
       advanceProgress()
 
@@ -948,8 +937,7 @@ export default function CreateLink() {
         }
 
         if (!images.length) {
-          // Only chunk 0's text carries the viewer URL; if it fails entirely,
-          // the next chunk would become a root post without it. Abort instead.
+          // Only the first chunk carries the viewer URL; it cannot be skipped.
           if (index === 0) {
             throw (
               firstUploadError ??
@@ -971,8 +959,6 @@ export default function CreateLink() {
         const facets =
           richText.facets && richText.facets.length ? richText.facets : undefined
 
-        // Bluesky renders 5+ images only via the gallery (carousel) embed;
-        // the legacy images embed is capped at 4 and keeps the grid layout.
         const embed =
           images.length >= GALLERY_MIN_IMAGES
             ? {
@@ -1029,8 +1015,7 @@ export default function CreateLink() {
       const rootRef: StrongRef = root
 
       setUploadStatus('リーダーと紐づけ中...')
-      // Best-effort record write, then record-verified completion. The link
-      // must still activate when either step fails.
+      // Fall back to service-auth completion if record writing or verification fails.
       let recordRef: { uri: string; cid: string } | null = null
       try {
         recordRef = await timed('レコード作成', () =>
@@ -1063,8 +1048,6 @@ export default function CreateLink() {
             }),
           )
         } catch (completeErr) {
-          // Record exists but verification failed: activate via legacy and
-          // surface the unverified state.
           console.error('record-based completion failed', completeErr)
           recordNotice = RECORD_VERIFY_NOTICE
           completeResult = await timed('リンク紐づけ', () =>

@@ -13,8 +13,6 @@ export default function Home() {
 
   useEffect(() => {
     if (status === 'authenticated') {
-      // postLoginPath carries logins that started elsewhere (e.g. /manage)
-      // back to where they began after the OAuth round trip.
       navigate(postLoginPath ?? '/create')
     }
   }, [navigate, status, postLoginPath])

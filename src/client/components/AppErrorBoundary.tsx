@@ -3,8 +3,7 @@ import { Component, type ReactNode } from 'react'
 const RELOAD_GUARD_KEY = 'skybind:chunk-reload-at'
 const RELOAD_GUARD_MS = 30_000
 
-// Stale deployments make hashed chunk URLs 404, so lazy imports reject with
-// browser-specific messages (Chrome / Firefox / Safari).
+// Deployments can invalidate chunk URLs; import errors vary by browser.
 const isChunkLoadError = (error: unknown) =>
   error instanceof Error &&
   /dynamically imported module|Importing a module script failed|Unable to preload CSS|Loading chunk/i.test(

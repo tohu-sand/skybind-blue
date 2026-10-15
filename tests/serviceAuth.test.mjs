@@ -1,7 +1,3 @@
-// Adversarial regression tests for src/server/serviceAuth.ts.
-// Run with: npm run test:auth
-// (bundles the module with esbuild first — no Workers runtime needed; DID
-// resolution and D1 are mocked.)
 import { secp256k1 } from '@noble/curves/secp256k1.js'
 import { base58 } from '@scure/base'
 import { createHash } from 'node:crypto'
@@ -92,9 +88,7 @@ const makeJwt = (headerOverrides = {}, payloadOverrides = {}, opts = {}) => {
 
 let pass = 0
 let fail = 0
-// shouldPass=false may pin the EXACT rejection via errorPattern, so an
-// unrelated exception (or `throw undefined`) cannot masquerade as the
-// expected refusal.
+// Match the expected error so unrelated failures cannot pass rejection tests.
 const check = async (name, fn, shouldPass, errorPattern) => {
   let ok
   let detail = ''
@@ -152,8 +146,7 @@ await check('tampered payload rejected', () => {
 await check('high-S signature rejected (malleability)', () => verify(makeJwt({}, {}, { highS: true })), false)
 
 console.log('--- DID document constraints (uncached DIDs) ---')
-// A dedicated DID per case: mutating the shared doc would be masked by the
-// module's cache, which still holds the valid copy.
+// Use a separate DID per case so cached documents cannot mask mutations.
 const constraintCase = async (name, mutate) => {
   const iss = `did:plc:${name.padEnd(24, 'x').slice(0, 24)}`
   const doc = {
@@ -234,7 +227,7 @@ const WEB_ISS = 'did:web:evil-pds.example.com'
   fetchOverride = () => {
     const stream = new ReadableStream({
       pull(controller) {
-        // 16 KiB per pull, endless supply: only reads consume it.
+        // Supply chunks on demand without ending the stream.
         enqueued += 16384
         controller.enqueue(new Uint8Array(16384))
       },
@@ -248,8 +241,7 @@ const WEB_ISS = 'did:web:evil-pds.example.com'
     /大きすぎ/,
   )
   fetchOverride = null
-  // Independent assertion: the reader must stop within two chunks of the cap
-  // (one read that crosses the cap + one chunk of stream readahead).
+  // Allow one chunk to cross the cap and one for stream readahead.
   console.log(`   bytes served before cutoff: ${enqueued}`)
   if (enqueued > 64 * 1024 + 2 * 16384) {
     fail += 1
@@ -260,7 +252,6 @@ const WEB_ISS = 'did:web:evil-pds.example.com'
   }
 }
 {
-  // Declared-oversize responses must have their unread body cancelled.
   let cancelled = false
   fetchOverride = () => {
     const stream = new ReadableStream({
@@ -296,7 +287,7 @@ await check('slow body aborted by timeout (~5s)', async () => {
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(new TextEncoder().encode('{'))
-        // never closes; the fetch timeout must abort the read
+        // Keep the stream open until the fetch timeout aborts it.
         init?.signal?.addEventListener('abort', () => {
           try {
             controller.error(new Error('aborted'))
@@ -366,8 +357,7 @@ await check('pre-rotation token accepted (caches old key)', () => verify(rotJwt(
 rotDoc.verificationMethod[0].publicKeyMultibase = toMultikey(secp256k1.getPublicKey(priv2))
 await check('OLD-key token still valid while cache is fresh', () => verify(rotJwt(priv, 'rot-b')), true)
 await check('NEW-key token accepted via cache bypass', () => verify(rotJwt(priv2, 'rot-c')), true)
-// The forced refetch consumed ROT_ISS's cooldown slot and cached the NEW key.
-// An old-key token must now be rejected WITHOUT another fetch.
+// The forced refetch cached the new key and started this DID's cooldown.
 {
   const before = fetchCount
   await check(
@@ -386,7 +376,7 @@ await check('NEW-key token accepted via cache bypass', () => verify(rotJwt(priv2
 }
 fetchOverride = null
 
-// Uncached DID + wrong key: exactly one fetch, no forced-refetch amplification.
+// A separate DID ensures the wrong-key test starts without a cached document.
 const ISS2 = 'did:plc:bbcdefghijklmnopqrstuvwx'
 const doc2 = {
   ...didDoc,
@@ -401,7 +391,7 @@ const beforeUncached = fetchCount
 await check('uncached DID: wrong-key signature rejected', () => {
   const h = enc({ typ: 'JWT', alg: 'ES256K' })
   const p = enc({ iss: ISS2, aud: AUD, lxm: LXM, iat: now(), exp: now() + 60, jti: 'stale-1' })
-  // Signed with priv2, but doc2 publishes the ORIGINAL pub — wrong key.
+  // doc2 publishes pub, but this token is signed with priv2.
   return verify(`${h}.${p}.${b64url(signWith(priv2, h, p))}`)
 }, false, /署名の検証に失敗/)
 fetchOverride = null

@@ -1,9 +1,7 @@
 import type { Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 
-// The caller's DID is NOT part of any payload: reserve/generate/legacy-complete
-// take it from the verified service-auth JWT, and record-complete derives it
-// from the record itself.
+// Caller identity comes from service auth or the verified record, never the payload.
 type GeneratePayload = {
   postUrl: string
   title?: string
@@ -15,10 +13,7 @@ type ReservePayload = {
   startSide: 'right' | 'left'
 }
 
-// New clients complete by pointing at the blue.skybind.comic record they wrote
-// (ownership proof: only the account holder can write to their own repo).
-// Legacy shape (postUrl) remains as a fallback for runs where the record
-// write failed; it requires service auth instead.
+// A failed record write falls back to postUrl with service auth.
 type CompletePayload =
   | { kind: 'record'; id: string; recordUri: string; recordCid: string }
   | { kind: 'legacy'; id: string; postUrl: string }
@@ -26,9 +21,7 @@ type CompletePayload =
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
 
-// Hard cap on the raw request body, enforced on the actual bytes BEFORE JSON
-// parsing: Cloudflare accepts request bodies up to 100MB, far above the
-// isolate memory limit, and these payloads are legitimately tiny.
+// Cap actual bytes before parsing; Content-Length may be missing or incorrect.
 const MAX_BODY_BYTES = 16 * 1024
 
 const readJsonBody = async (c: Context): Promise<Record<string, unknown>> => {
@@ -118,9 +111,7 @@ export async function readReservePayload(c: Context): Promise<ReservePayload> {
   }
 }
 
-// Link ids come from generateShortId (10 base64url chars); the pattern allows
-// slack but keeps ids unusable as a memory-DoS vector (they become rate-limit
-// map keys held for the window).
+// Bound ID length because IDs are retained as rate-limit map keys.
 export const LINK_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 
 export async function readCompletePayload(c: Context): Promise<CompletePayload> {
@@ -136,8 +127,7 @@ export async function readCompletePayload(c: Context): Promise<CompletePayload> 
 
   const recordUri = String(body.recordUri || '').trim()
   if (recordUri) {
-    // Required so the server can pin verification to the exact version the
-    // client wrote (TOCTOU detection).
+    // Pin verification to the version the client wrote.
     const recordCid = String(body.recordCid || '').trim()
     if (!recordCid) {
       throw new HTTPException(400, { message: 'recordCidが必要です。' })

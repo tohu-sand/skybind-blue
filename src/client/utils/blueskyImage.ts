@@ -1,30 +1,19 @@
-// Bluesky's app.bsky.embed.images lexicon allows blobs up to 2,000,000 bytes
-// (raised from 1MB in April 2026); keep ~3% headroom under that ceiling.
+// Leave 3% headroom below Bluesky's 2,000,000-byte blob limit.
 const TARGET_BYTES = 1_940_000
-// The CDN serves fullsize renditions at up to 4000x4000 (raised from
-// 2000x2000 in April 2026); pixels beyond that never reach readers.
+// The CDN serves fullsize images at up to 4000x4000.
 const MAX_DIM = 4000
 const Q_WEBP = 0.9
 const Q_JPEG = 0.85
-// Scale search: compressed size follows bytes ≈ C·pixels^alpha. Manga pages
-// (mono 600dpi and color covers) measure alpha in 0.66–0.85, so predict the
-// next scale from that model instead of bisecting.
 const ALPHA_PRIOR = 0.8
 const ALPHA_MIN = 0.5
 const ALPHA_MAX = 1.1
-// Aim predictions slightly under the ceiling so the first jump usually lands
-// inside the acceptance band [ACCEPT_BYTES, TARGET_BYTES].
+// Leave room for prediction error.
 const PREDICT_BYTES = Math.round(TARGET_BYTES * 0.95)
 const ACCEPT_BYTES = Math.round(TARGET_BYTES * 0.87)
 const MAX_ATTEMPTS = 5
-// Stay just below a scale that is known to overshoot.
 const OVERSHOOT_BACKOFF = 0.97
-// Don't spend another encode for less than a 2% linear-resolution gain.
 const MIN_GAIN = 1.02
-// The CDN (imgproxy) refuses sources above some undocumented resolution.
-// A 26.1MP production upload verifiably renders (2026-07), so pass files
-// through untouched only up to that; anything larger gets re-encoded to
-// dimensions the CDN is guaranteed to accept.
+// Conservative passthrough limit for the CDN's undocumented source-pixel cap.
 const MAX_PASSTHROUGH_PIXELS = 26_000_000
 
 type CompressionCapabilities = {
@@ -128,9 +117,7 @@ const testBitmapResize = async () => {
 }
 
 const testWebP = async () => {
-  // Probe the same surface the encoder uses: convertToBlob silently falls
-  // back to PNG for unsupported types, so an HTMLCanvasElement probe would
-  // not prove anything about the OffscreenCanvas path.
+  // Probe the encoding canvas: unsupported MIME types silently fall back to PNG.
   if (typeof OffscreenCanvas !== 'undefined') {
     try {
       const canvas = new OffscreenCanvas(1, 1)
@@ -206,11 +193,8 @@ const getFileMime = (file: File) => {
   return 'image/png'
 }
 
-// Find the largest resolution that encodes under TARGET_BYTES at a fixed
-// quality, using as few encodes as possible. Each attempt fits the power
-// model bytes ≈ C·pixels^alpha to the samples so far and jumps straight to
-// the predicted critical scale, instead of bisecting. On the manga corpus
-// this lands within 4% of the true critical resolution in 1–3 encodes.
+// Search for the largest image under TARGET_BYTES at fixed quality.
+// Predict scale from bytes ≈ C·pixels^alpha, fitted to the latest samples.
 const compressImage = async (
   file: File,
   caps: CompressionCapabilities,
@@ -222,8 +206,6 @@ const compressImage = async (
     let format = caps.supportsWebP ? 'image/webp' : 'image/jpeg'
     let quality = format === 'image/webp' ? Q_WEBP : Q_JPEG
 
-    // Pixels beyond the CDN's 4000x4000 rendition cap never reach readers,
-    // so the search starts there (or at the original size if smaller).
     const maxScale = Math.min(1, MAX_DIM / sourceWidth, MAX_DIM / sourceHeight)
 
     type Sample = { scale: number; pixels: number; bytes: number }
@@ -241,9 +223,7 @@ const compressImage = async (
       const canvas = await downscaleToCanvas(decoded.source, width, height, caps)
       let blob = await canvasToBlob(canvas, format, quality)
       if (blob.type && blob.type !== format && format === 'image/webp') {
-        // The encoder silently fell back to another type (convertToBlob does
-        // this instead of throwing), so its bytes don't follow the WebP size
-        // model. JPEG encoding is universally supported.
+        // Use JPEG when the WebP encoder silently falls back to another format.
         format = 'image/jpeg'
         quality = Q_JPEG
         blob = await canvasToBlob(canvas, format, quality)
@@ -258,8 +238,7 @@ const compressImage = async (
       try {
         encoded = await encodeAt(scale)
       } catch (err) {
-        // Keep an already-found fitting result instead of failing the file
-        // when a later refinement encode dies (e.g. under memory pressure).
+        // A later encode may fail under memory pressure; keep any result that fits.
         if (best) {
           break
         }
@@ -271,8 +250,6 @@ const compressImage = async (
         if (!best || scale > best.scale) {
           best = { blob, width, height, scale }
         }
-        // Close enough to the ceiling (or already at the resolution cap):
-        // more encodes would buy almost no resolution.
         if (blob.size >= ACCEPT_BYTES || scale >= maxScale * 0.999) {
           break
         }
@@ -306,9 +283,7 @@ const compressImage = async (
       scale = next
     }
 
-    // The bracketing above should always leave a fitting result; as a last
-    // resort keep shrinking hard until one fits. Never return an over-limit
-    // blob: failing loudly beats a guaranteed uploadBlob rejection.
+    // The size model may miss; keep shrinking until the upload limit is met.
     while (!best) {
       scale *= 0.7
       if (scale < maxScale * 0.05) {
@@ -352,8 +327,6 @@ type DecodedImage = {
   close: () => void
 }
 
-// Decode the file exactly once; every later canvas draw reuses this source
-// instead of re-decoding the file.
 const decodeImage = async (file: File): Promise<DecodedImage> => {
   if (typeof createImageBitmap === 'function') {
     try {
@@ -365,8 +338,7 @@ const decodeImage = async (file: File): Promise<DecodedImage> => {
         close: () => bitmap.close?.(),
       }
     } catch {
-      // Some browsers expose createImageBitmap but reject supported files or
-      // the orientation option. The regular image decoder can still handle them.
+      // Some browsers reject files or options supported by the image decoder.
     }
   }
   const img = await loadImage(file)
@@ -400,8 +372,7 @@ const renderToCanvas = (
   caps: CompressionCapabilities,
 ) => {
   const canvas = createCanvas(width, height, caps.supportsOffscreenCanvas)
-  // Explicit type: '2d' on the union resolves order-dependently in TS 5.9
-  // (another getContext call site can flip it to the generic overload).
+  // Narrow the overlapping HTMLCanvasElement and OffscreenCanvas overloads.
   const ctx = canvas.getContext('2d') as
     | CanvasRenderingContext2D
     | OffscreenCanvasRenderingContext2D
@@ -412,8 +383,7 @@ const renderToCanvas = (
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
 
-  // Flatten transparency onto white: JPEG output (and Bluesky's CDN, which
-  // re-serves fullsize as JPEG) would otherwise render transparent areas black.
+  // Flatten transparency to white before JPEG encoding or CDN conversion.
   ctx.fillStyle = '#fff'
   ctx.fillRect(0, 0, width, height)
   ctx.drawImage(source, 0, 0, width, height)
@@ -437,8 +407,7 @@ const downscaleToCanvas = async (
       resized.close?.()
       return canvas
     } catch {
-      // The capability probe used a Blob source; if a bitmap source is
-      // rejected, fall through to the plain canvas downscale.
+      // A Blob resize probe does not guarantee support for ImageBitmap sources.
     }
   }
   return renderToCanvas(source, targetWidth, targetHeight, caps)

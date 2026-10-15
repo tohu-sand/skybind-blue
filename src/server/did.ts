@@ -1,9 +1,4 @@
-// Hardened DID → DID-document resolution, shared by service-auth JWT
-// verification (signing keys) and comic-record verification (PDS endpoints).
-// Every code path that turns an untrusted DID into an outbound fetch MUST go
-// through this module: the DID syntax and resulting host are validated before
-// any network access (SSRF), redirects are never followed, and the fetch is
-// bounded by a timeout and a response-size cap.
+// Resolve untrusted DIDs here so auth and record verification share SSRF guards.
 
 const DID_DOC_CACHE_TTL_MS = 5 * 60 * 1000
 export const DID_DOC_CACHE_MAX = 100
@@ -31,15 +26,11 @@ export type DidDocument = {
 
 const didDocCache = new Map<string, { doc: DidDocument; expires: number }>()
 
-// The DID is attacker-controlled at this point (a JWT `iss` before signature
-// verification, or a record URI), so the syntax and the resulting host are
-// validated up front to prevent SSRF.
-
 const PLC_DID_PATTERN = /^did:plc:[a-z2-7]{24}$/
 const WEB_DID_PATTERN = /^did:web:[a-zA-Z0-9._%-]+$/
 const HOSTNAME_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/
 
-// TLDs that atproto handles (and therefore did:web hosts) must never use:
+// Reserved TLDs for atproto handles and did:web hosts:
 // https://atproto.com/specs/handle#additional-non-syntax-restrictions
 const FORBIDDEN_TLDS = new Set([
   'alt',
@@ -57,7 +48,7 @@ const isForbiddenHost = (hostname: string) => {
   if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
     return true
   }
-  // IPv4 literal (any) and IPv6 literal (bracketed) are never valid did:web hosts.
+  // did:web hosts must be DNS names, not IP literals.
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) {
     return true
   }
@@ -69,25 +60,17 @@ const isForbiddenHost = (hostname: string) => {
     return true
   }
   const tld = labels[labels.length - 1]
-  // The final label must be a real, letter-initial TLD.
   if (FORBIDDEN_TLDS.has(tld) || !/^[a-z]/.test(tld)) {
     return true
   }
   return false
 }
 
-// Whether a hostname is acceptable as an outbound-fetch target for
-// attacker-influencable URLs (did:web hosts, PDS endpoints read from DID
-// documents): well-formed lowercase DNS name, no IP literals, no localhost,
-// no reserved TLDs.
 export const isPublicHostname = (hostname: string) =>
   HOSTNAME_PATTERN.test(hostname) && !isForbiddenHost(hostname)
 
-// Reads a response body while enforcing a hard cap on the actual bytes
-// received (content-length is attacker-declared and may be absent). The
-// caller's AbortController is aborted on overflow so the transfer stops; on
-// a declared-oversize early reject the unread body is released (Workers
-// otherwise keeps the stream and its memory alive).
+// Count actual bytes; Content-Length may be missing or incorrect.
+// Cancel rejected bodies to release the stream and its memory in Workers.
 export const readBodyCapped = async (
   response: Response,
   controller: AbortController,
@@ -135,8 +118,7 @@ export const readBodyCapped = async (
 }
 
 export const didToDocumentUrl = (did: string): string => {
-  // DIDs are case-sensitive identifiers; per the spec, incorrectly-cased
-  // protocol input is rejected rather than normalized.
+  // DIDs are case-sensitive; reject invalid casing rather than normalize it.
   if (did !== did.toLowerCase()) {
     throw new Error('未対応のDID形式です。')
   }
@@ -146,7 +128,7 @@ export const didToDocumentUrl = (did: string): string => {
   if (!WEB_DID_PATTERN.test(did)) {
     throw new Error('未対応のDID形式です。')
   }
-  // did:web with path segments (host:path:parts) is not used by atproto PDSes.
+  // atproto supports did:web hosts without path segments.
   const encodedHost = did.slice('did:web:'.length)
   let host: string
   try {
@@ -154,12 +136,11 @@ export const didToDocumentUrl = (did: string): string => {
   } catch {
     throw new Error('未対応のDID形式です。')
   }
-  // Percent-encoding could smuggle uppercase past the DID-level check.
+  // Decoding may reveal uppercase characters hidden from the DID-level check.
   if (host !== host.toLowerCase()) {
     throw new Error('未対応のDID形式です。')
   }
-  // Re-validate AFTER decoding: percent-encoding can smuggle userinfo ("@"),
-  // ports, paths, queries and fragments past the raw pattern.
+  // Decoding may also reveal userinfo, ports, paths, queries or fragments.
   if (!HOSTNAME_PATTERN.test(host) || isForbiddenHost(host)) {
     throw new Error('未対応のDID形式です。')
   }
@@ -183,19 +164,17 @@ export const fetchDidDocument = async (
 
   const docUrl = didToDocumentUrl(did)
   const controller = new AbortController()
-  // The timer must cover the BODY too: an attacker-owned did:web could send
-  // headers instantly and then drip-feed (or flood) the body.
+  // Include the body read in the timeout to bound slow or oversized responses.
   const timer = setTimeout(() => controller.abort(), DID_FETCH_TIMEOUT_MS)
   let body: string
   try {
     const response = await fetch(docUrl, {
       headers: { Accept: 'application/json' },
-      // Never chase a redirect: it could point at an internal address.
+      // Redirects could point to internal addresses.
       redirect: 'manual',
       signal: controller.signal,
     })
-    // Early rejects must release the unread body (Workers otherwise keeps
-    // the stream and its memory alive).
+    // Release the unread body on early rejection.
     if (!response.ok) {
       await response.body?.cancel().catch(() => {})
       throw new Error(`DIDの解決に失敗しました。(${response.status})`)

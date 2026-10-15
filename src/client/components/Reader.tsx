@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -50,9 +51,14 @@ export default function Reader({
   const [nsfwRevealed, setNsfwRevealed] = useState(false)
   const leftStartSpread = isSpread && startOnLeft
   const preloadedRef = useRef<Set<string>>(new Set())
-  const previousSpreadRef = useRef(isSpread)
-  const previousPagesRef = useRef<ReaderPage[] | null>(null)
-  const previousInitialPageRef = useRef<number | undefined>(undefined)
+  const previousViewRef = useRef<{
+    pages: ReaderPage[]
+    initialPage: number | undefined
+    isSpread: boolean
+    startOnLeft: boolean
+  } | null>(null)
+  const animationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const gestureRef = useRef<HTMLDivElement>(null)
   const [swipeOffset, setSwipeOffset] = useState(0)
   const [isAnimating, setIsAnimating] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -61,7 +67,6 @@ export default function Reader({
     pointerId: null as number | null,
     startX: 0,
     startY: 0,
-    currentX: 0,
     isDragging: false,
   })
 
@@ -85,40 +90,29 @@ export default function Reader({
     }
   }, [])
 
-  useEffect(() => {
-    const pagesChanged = previousPagesRef.current !== pages
-    const initialPageChanged = previousInitialPageRef.current !== initialPage
-    if (!pagesChanged && !initialPageChanged) {
-      return
+  const resetPointer = useCallback(() => {
+    const pointerId = pointerState.current.pointerId
+    pointerState.current = {
+      pointerId: null,
+      startX: 0,
+      startY: 0,
+      isDragging: false,
     }
-
-    previousPagesRef.current = pages
-    previousInitialPageRef.current = initialPage
-
-    if (!pages.length) {
-      setIndex(0)
-      setNsfwRevealed(false)
-      preloadedRef.current = new Set()
-      return
+    const target = gestureRef.current
+    if (pointerId !== null && target?.hasPointerCapture(pointerId)) {
+      target.releasePointerCapture(pointerId)
     }
+  }, [])
 
-    const safePage =
-      typeof initialPage === 'number' && Number.isFinite(initialPage)
-        ? Math.floor(initialPage)
-        : 1
-    const clampedPage = clamp(safePage, 1, pages.length)
-    const logicalIndex = clampedPage - 1
-
-    if (!isSpread) {
-      setIndex(logicalIndex)
-    } else {
-      const adjustedIndex = leftStartSpread ? logicalIndex + 1 : logicalIndex
-      setIndex(adjustedIndex - (adjustedIndex % 2))
+  const cancelInteraction = useCallback(() => {
+    if (animationTimerRef.current !== null) {
+      clearTimeout(animationTimerRef.current)
+      animationTimerRef.current = null
     }
-
-    setNsfwRevealed(false)
-    preloadedRef.current = new Set()
-  }, [initialPage, isSpread, leftStartSpread, pages])
+    resetPointer()
+    setSwipeOffset(0)
+    setIsAnimating(false)
+  }, [resetPointer])
 
   const viewLength = useMemo(() => {
     if (!pages.length) {
@@ -137,29 +131,40 @@ export default function Reader({
     return viewLength % 2 === 0 ? viewLength - 2 : viewLength - 1
   }, [pages.length, isSpread, viewLength])
 
-  useEffect(() => {
-    const wasSpread = previousSpreadRef.current
-    if (wasSpread === isSpread) {
-      return
-    }
-
-    previousSpreadRef.current = isSpread
-
-    if (isSpread) {
-      setIndex((prev) => {
-        const parity = prev % 2
-        const spreadIndex = startOnLeft ? prev + parity : prev - parity
-        return Math.min(Math.max(spreadIndex, 0), maxIndex)
-      })
-      return
-    }
+  useLayoutEffect(() => {
+    const previous = previousViewRef.current
+    const resetPage = !previous || previous.pages !== pages || previous.initialPage !== initialPage
+    previousViewRef.current = { pages, initialPage, isSpread, startOnLeft }
+    cancelInteraction()
 
     setIndex((prev) => {
-      const lastIndex = Math.max(0, pages.length - 1)
-      const logicalIndex = startOnLeft ? prev - 1 : prev
-      return Math.min(Math.max(logicalIndex, 0), lastIndex)
+      let logicalIndex: number
+      if (resetPage) {
+        const safePage = typeof initialPage === 'number' && Number.isFinite(initialPage)
+          ? Math.floor(initialPage)
+          : 1
+        logicalIndex = clamp(safePage - 1, 0, Math.max(0, pages.length - 1))
+      } else {
+        // Remove the previous layout's leading blank page before reindexing.
+        logicalIndex = Math.max(0, prev - (previous.isSpread && previous.startOnLeft ? 1 : 0))
+      }
+      const viewIndex = logicalIndex + (leftStartSpread ? 1 : 0)
+      return clamp(isSpread ? viewIndex - (viewIndex % 2) : logicalIndex, 0, maxIndex)
     })
-  }, [isSpread, startOnLeft, maxIndex, pages.length])
+
+    if (resetPage) {
+      setNsfwRevealed(false)
+      preloadedRef.current = new Set()
+    }
+
+    return cancelInteraction
+  }, [pages, initialPage, isSpread, startOnLeft, leftStartSpread, maxIndex, cancelInteraction])
+
+  useEffect(() => {
+    // Resizing changes swipe distances even when the layout mode stays the same.
+    window.addEventListener('resize', cancelInteraction)
+    return () => window.removeEventListener('resize', cancelInteraction)
+  }, [cancelInteraction])
 
   const pageStep = isSpread ? 2 : 1
 
@@ -179,27 +184,46 @@ export default function Reader({
     [pages, toLogicalIndex],
   )
 
-  const goNext = useCallback(() => {
-    setIndex((prev) => Math.min(prev + pageStep, maxIndex))
-  }, [maxIndex, pageStep])
-
-  const goPrev = useCallback(() => {
-    setIndex((prev) => Math.max(prev - pageStep, 0))
-  }, [pageStep])
+  const navigate = useCallback((direction: -1 | 1, animate = false) => {
+    // Refs block overlapping events before React commits state updates.
+    if (animationTimerRef.current !== null || pointerState.current.pointerId !== null) {
+      return
+    }
+    const targetIndex = clamp(index + direction * pageStep, 0, maxIndex)
+    if (targetIndex === index) {
+      setSwipeOffset(0)
+      return
+    }
+    const width = containerRef.current?.getBoundingClientRect().width
+    if (animate && !isSpread && width) {
+      setSwipeOffset(direction * width)
+      setIsAnimating(true)
+      animationTimerRef.current = setTimeout(() => {
+        animationTimerRef.current = null
+        setIndex(targetIndex)
+        setSwipeOffset(0)
+        setIsAnimating(false)
+      }, 200)
+    } else {
+      setIndex((prev) => clamp(prev + direction * pageStep, 0, maxIndex))
+    }
+  }, [index, isSpread, maxIndex, pageStep])
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key === 'ArrowLeft') {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey ||
+        (event.target instanceof HTMLElement &&
+          (event.target.isContentEditable || event.target.closest('input, textarea, select')))) {
+        return
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
         event.preventDefault()
-        goNext()
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        goPrev()
+        navigate(event.key === 'ArrowLeft' ? 1 : -1)
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [goNext, goPrev])
+  }, [navigate])
 
   useEffect(() => {
     const schedule =
@@ -234,14 +258,6 @@ export default function Reader({
     return () => cancel(id)
   }, [getPageAt, index, isSpread])
 
-  const resetPointer = () => {
-    pointerState.current.pointerId = null
-    pointerState.current.startX = 0
-    pointerState.current.startY = 0
-    pointerState.current.currentX = 0
-    pointerState.current.isDragging = false
-  }
-
   const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (!pages.length || event.button !== 0) {
       return
@@ -249,13 +265,12 @@ export default function Reader({
     if (pointerState.current.pointerId !== null) {
       return
     }
-    if (isAnimating) {
+    if (animationTimerRef.current !== null) {
       return
     }
     pointerState.current.pointerId = event.pointerId
     pointerState.current.startX = event.clientX
     pointerState.current.startY = event.clientY
-    pointerState.current.currentX = event.clientX
     pointerState.current.isDragging = false
     event.currentTarget.setPointerCapture(event.pointerId)
   }
@@ -275,8 +290,6 @@ export default function Reader({
     }
 
     if (pointerState.current.isDragging) {
-      pointerState.current.currentX = event.clientX
-      // Only allow swipe in valid directions
       const canGoPrev = index > 0
       const canGoNext = index < pages.length - 1
       if ((dx < 0 && canGoPrev) || (dx > 0 && canGoNext)) {
@@ -294,101 +307,40 @@ export default function Reader({
     if (pointerState.current.pointerId !== event.pointerId) {
       return
     }
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId)
-    }
-
     const rect = event.currentTarget.getBoundingClientRect()
     const dx = event.clientX - pointerState.current.startX
     const dy = event.clientY - pointerState.current.startY
     const swipeThreshold = Math.max(32, Math.min(80, rect.width * 0.08))
     const tapThreshold = 12
 
-    if (!isSpread && pointerState.current.isDragging) {
+    const wasDragging = pointerState.current.isDragging
+    resetPointer()
+
+    if (!isSpread && wasDragging) {
       const containerWidth = containerRef.current?.getBoundingClientRect().width || rect.width
-      const threshold = containerWidth * 0.15
-
-      const canGoPrev = index > 0
-      const canGoNext = index < pages.length - 1
-      const wantsPrev = dx < 0
-      const wantsNext = dx > 0
-
-      if (Math.abs(dx) > threshold && ((wantsPrev && canGoPrev) || (wantsNext && canGoNext))) {
-        const targetOffset = wantsPrev ? -containerWidth : containerWidth
-        setSwipeOffset(targetOffset)
-        setIsAnimating(true)
-
-        setTimeout(() => {
-          if (wantsPrev) {
-            setIndex((prev) => Math.max(prev - 1, 0))
-          } else {
-            setIndex((prev) => Math.min(prev + 1, pages.length - 1))
-          }
-          setSwipeOffset(0)
-          setIsAnimating(false)
-        }, 200)
+      if (Math.abs(dx) > containerWidth * 0.15) {
+        navigate(dx > 0 ? 1 : -1, true)
       } else {
         setSwipeOffset(0)
       }
-      resetPointer()
       return
     }
 
     if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > swipeThreshold) {
-      if (dx < 0) {
-        goPrev()
-      } else {
-        goNext()
-      }
-      resetPointer()
+      navigate(dx > 0 ? 1 : -1, true)
       return
     }
 
     if (Math.abs(dx) <= tapThreshold && Math.abs(dy) <= tapThreshold) {
       const x = event.clientX - rect.left
-      if (!isSpread) {
-        const containerWidth = containerRef.current?.getBoundingClientRect().width || rect.width
-        if (x < rect.width / 2) {
-          if (index < pages.length - 1) {
-            setSwipeOffset(containerWidth)
-            setIsAnimating(true)
-            setTimeout(() => {
-              setIndex((prev) => Math.min(prev + 1, pages.length - 1))
-              setSwipeOffset(0)
-              setIsAnimating(false)
-            }, 200)
-          }
-        } else {
-          if (index > 0) {
-            setSwipeOffset(-containerWidth)
-            setIsAnimating(true)
-            setTimeout(() => {
-              setIndex((prev) => Math.max(prev - 1, 0))
-              setSwipeOffset(0)
-              setIsAnimating(false)
-            }, 200)
-          }
-        }
-      } else {
-        if (x < rect.width / 2) {
-          goNext()
-        } else {
-          goPrev()
-        }
-      }
+      navigate(x < rect.width / 2 ? 1 : -1, true)
     }
-    resetPointer()
   }
 
   const handlePointerCancel = (event: PointerEvent<HTMLDivElement>) => {
-    if (pointerState.current.pointerId !== event.pointerId) {
-      return
+    if (pointerState.current.pointerId === event.pointerId) {
+      cancelInteraction()
     }
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId)
-    }
-    setSwipeOffset(0)
-    resetPointer()
   }
 
   const revealAllNsfw = () => {
@@ -455,10 +407,12 @@ export default function Reader({
       <div className="relative z-10 flex h-screen w-screen items-center justify-center p-2 sm:p-6">
         <div
           className="relative h-full w-full max-w-[1500px] select-none animate-soft-in"
+          ref={gestureRef}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerCancel}
+          onLostPointerCapture={handlePointerCancel}
           role="presentation"
           style={{ touchAction: 'none' }}
         >

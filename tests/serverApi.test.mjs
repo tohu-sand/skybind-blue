@@ -1,8 +1,3 @@
-// Integration tests for the link API (src/server/index.ts) and the shared
-// DID resolver as used by resolvePdsEndpoint (src/server/manga.ts).
-// Run with: npm run test:api
-// (bundles the modules with esbuild first — no Workers runtime needed; DID
-// resolution, PDS, the Bluesky public API and D1 are all mocked.)
 import { secp256k1 } from '@noble/curves/secp256k1.js'
 import { base58 } from '@scure/base'
 import { createHash } from 'node:crypto'
@@ -27,7 +22,6 @@ const postUri = (rkey, did = AUTHOR) => `at://${did}/app.bsky.feed.post/${rkey}`
 const recUri = (rkey, did = AUTHOR) => `at://${did}/${COLLECTION}/${rkey}`
 const viewer = (id) => `https://skybind.blue/v/${id}`
 
-// --- service-auth JWT helpers (legacy-fallback and /generate tests) ---------
 const priv = secp256k1.utils.randomSecretKey()
 const pub = secp256k1.getPublicKey(priv)
 const privOther = secp256k1.utils.randomSecretKey()
@@ -63,11 +57,10 @@ const makeJwt = (iss = AUTHOR, privateKey = priv) => {
   return `${h}.${p}.${b64url(signWith(privateKey, h, p))}`
 }
 
-// --- network mock ------------------------------------------------------------
-const didDocs = new Map() // did -> DID document
+const didDocs = new Map() // DID -> DID document
 const records = new Map() // `${repo}|${collection}|${rkey}` -> getRecord response
-const threads = new Map() // post uri -> post view
-const feeds = new Map() // did -> getAuthorFeed items (single page, no cursor)
+const threads = new Map() // Post URI -> post view
+const feeds = new Map() // DID -> getAuthorFeed items (single page, no cursor)
 const fetchLog = []
 let lastDidFetchInit = null
 let fetchOverride = null
@@ -164,11 +157,10 @@ globalThis.fetch = async (input, init) => {
   return new Response(`unexpected fetch: ${url}`, { status: 500 })
 }
 
-// --- D1 fake -----------------------------------------------------------------
 const makeDb = () => {
   const rows = new Map()
   const jtiSeen = new Set()
-  // Mirrors COUNT_LINKS_SQL / QUOTA_GUARD_SQL: expired pendings don't count.
+  // Match the quota SQL: pending links older than 24 hours do not count.
   const freshCount = (author) => {
     const cutoff = Math.floor(Date.now() / 1000) - 24 * 60 * 60
     let count = 0
@@ -193,8 +185,7 @@ const makeDb = () => {
                 return { count: freshCount(args[0]) }
               }
               if (sql.startsWith('SELECT id, author_did')) {
-                // Copy like real D1 does: the handler's later reads must see
-                // the SELECT-time snapshot, not concurrent mutations.
+                // Copy D1's SELECT snapshot so concurrent mutations stay isolated.
                 const row = rows.get(args[0])
                 return row ? { ...row } : null
               }
@@ -291,8 +282,7 @@ const makeDb = () => {
                 return { meta: { changes: 1 } }
               }
               if (sql.startsWith('DELETE FROM manga_links WHERE author_did')) {
-                // Expired-pending purge for one author (cutoff baked into SQL).
-                // Purge waits 180 days; only the quota exclusion is 24h.
+                // Match the 180-day SQL cutoff; quota expiry is 24 hours.
                 const [author] = args
                 const cutoff = Math.floor(Date.now() / 1000) - 180 * 24 * 60 * 60
                 let changes = 0
@@ -309,7 +299,6 @@ const makeDb = () => {
                 return { meta: { changes } }
               }
               if (sql.startsWith('DELETE FROM manga_links')) {
-                // WHERE id = ? AND author_did = ?
                 const [id, author] = args
                 const row = rows.get(id)
                 if (!row || row.author_did !== author) {
@@ -319,7 +308,7 @@ const makeDb = () => {
                 return { meta: { changes: 1 } }
               }
               if (sql.startsWith('INSERT INTO manga_links')) {
-                // Both creation INSERTs embed the atomic quota guard.
+                // Enforce the quota within each insert, as the SQL does.
                 if (sql.includes('WHERE NOT EXISTS')) {
                   const [id, author, title, pagesJson, startSide, uri] = args
                   for (const row of rows.values()) {
@@ -386,7 +375,7 @@ const ctx = {
   passThroughOnException() {},
 }
 
-// The viewer GET uses the Workers edge cache; a pass-through stub is enough.
+// Skip edge caching so viewer tests always exercise the request handler.
 globalThis.caches = {
   default: {
     async match() {
@@ -396,8 +385,7 @@ globalThis.caches = {
   },
 }
 
-// Unique per-request IP by default so the per-IP rate limit never couples
-// unrelated tests; the rate-limit test pins its own IP explicitly.
+// Use a fresh IP per request to isolate rate limits between tests.
 let ipCounter = 0
 const nextIp = () => `203.0.113.${(ipCounter += 1)}`
 const post = (path, body, opts = {}) =>
@@ -499,8 +487,7 @@ const ok = (name, cond, detail = '') => {
     console.log(`FAIL ${name}${detail ? ` — ${detail}` : ''}`)
   }
 }
-// Asserts BOTH the status and the exact rejection branch (via a message
-// fragment), so an unrelated failure cannot masquerade as the expected one.
+// Match the expected error so unrelated failures cannot pass rejection tests.
 const expectResponse = async (name, res, status, fragment) => {
   const body = await res.json().catch(() => ({}))
   const message = typeof body.error === 'string' ? body.error : ''
@@ -604,7 +591,6 @@ const badEndpoints = [
   ['pathendpoint', 'https://pds.example.com/base'],
   ['userendpoint', 'https://user@pds.example.com'],
   ['numendpoint2', 42],
-  // Internal/reserved targets smuggled via the DID document's serviceEndpoint.
   ['metaendpoint', 'https://169.254.169.254'],
   ['loopendpoint', 'https://127.0.0.1'],
   ['lhostendpoin', 'https://localhost'],
@@ -629,8 +615,7 @@ for (const [name, endpoint] of badEndpoints) {
   ok(`invalid PDS endpoint ${JSON.stringify(endpoint)} rejected`, rejected)
 }
 {
-  // The atproto DID spec allows explicit ports on PDS service endpoints; the
-  // public-host requirement must not reject them.
+  // PDS service endpoints may include an explicit port.
   const did = plcDid('portendpoint')
   didDocs.set(did, {
     id: did,
@@ -650,8 +635,6 @@ for (const [name, endpoint] of badEndpoints) {
   )
 }
 {
-  // Regression guard against over-blocking: a well-formed did:web must still
-  // resolve through /.well-known/did.json.
   const did = 'did:web:pds-host.example.org'
   didDocs.set(did, {
     id: did,
@@ -728,7 +711,7 @@ console.log('--- PDS record fetch: response handling ---')
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode('{'))
-          // never closes; the xrpc timeout must abort the read
+          // Keep the stream open until the fetch timeout aborts it.
           init?.signal?.addEventListener('abort', () => {
             try {
               controller.error(new Error('aborted'))
@@ -871,7 +854,6 @@ console.log('--- /api/manga/complete (record mode) ---')
   const id = 'lnkrkey001'
   const rkey = 'rkmis'
   addRow(id)
-  // Record rkey and subject rkey disagree.
   setRecord(rkey, comicValue(id, 'rkdifferent'))
   const res = await post('/api/manga/complete', {
     id,
@@ -1027,8 +1009,7 @@ console.log('--- request body / id limits (memory-DoS guards) ---')
   await expectResponse('id with invalid characters -> 400', res, 400, 'id')
 }
 {
-  // The IP bucket must be counted BEFORE body parsing: garbage bodies from
-  // one IP eventually 429 instead of endlessly parsing to 400.
+  // Malformed requests must consume the IP rate limit before body parsing.
   const ip = '198.51.100.88'
   const statuses = []
   for (let i = 0; i < 35; i += 1) {
@@ -1050,9 +1031,8 @@ console.log('--- request body / id limits (memory-DoS guards) ---')
 
 console.log('--- /api/manga/complete concurrency (CAS) ---')
 {
-  // Two different records race to activate the same pending link. A barrier
-  // holds both getRecord responses until both requests passed the row SELECT,
-  // so both observe state=pending; the CAS must let exactly one win.
+  // Hold both record fetches until both requests read the pending row.
+  // This forces the compare-and-swap updates to compete for the same version.
   const id = 'lnkrace001'
   const rkA = 'rkracea'
   const rkB = 'rkraceb'
@@ -1206,8 +1186,7 @@ console.log('--- /api/manga/generate (existing-link reuse) ---')
   await expectResponse("generate for someone else's thread -> 403", res, 403, '作者本人')
 }
 {
-  // Root post deleted (or logged-out-hidden): the thread fetch reports
-  // NotFound and the caller gets a specific message, not a generic 502.
+  // No thread entry simulates a deleted or private root post.
   const res = await post(
     '/api/manga/generate',
     { postUrl: postUri('rkgengone'), startSide: 'right' },
@@ -1246,9 +1225,7 @@ console.log('--- /api/manga/complete rate limiting ---')
     rest.every((s) => s === 429),
     rest.join(','),
   )
-  // The two limiter keys must act independently: an exhausted link id stays
-  // limited from a fresh IP, an exhausted IP stays limited on a fresh link,
-  // and an unrelated (IP, link) pair is unaffected.
+  // IP and link limits must apply independently.
   const freshIpSameLink = await post('/api/manga/complete', {
     id: 'lnkratelim',
     recordUri: recUri('rkratelim'),
@@ -1294,9 +1271,7 @@ console.log('--- /api/manage/links (list) ---')
     original_post_uri: postUri('rkmgo', OTHER),
     created_at: 300,
   })
-  // Fresh reservation: must be listed. Ancient reservation: must be purged.
-  // Mid-age reservation (quota-expired but inside the 180-day repair
-  // window): must survive and stay listed.
+  // Quota expiry after 24 hours must not shorten the 180-day repair window.
   addRow('lnkmgpendf', { created_at: now() })
   addRow('lnkmgpendx', { created_at: 100 })
   addRow('lnkmgpendm', { created_at: now() - 2 * 24 * 60 * 60 })
@@ -1410,8 +1385,6 @@ console.log('--- /api/manage/links/:id/record (record-only detach) ---')
   )
 }
 {
-  // Stale caller: a concurrent edit moved the record to a new CID, so the
-  // detach must conflict instead of wiping the newer verification.
   const res = await send(
     `/api/manage/links/lnkmg00002/record?expectedCid=${WRONG_CID}`,
     'DELETE',
@@ -1440,8 +1413,6 @@ console.log('--- /api/manage/links/:id/record (record-only detach) ---')
 
 console.log('--- record edit sync (manager save via record-mode /complete) ---')
 {
-  // An active link with a verified record: the author edits the record (new
-  // CID) and /complete must re-verify and sync D1 to the new version.
   const NEW_CID = 'bafyreieditedaaaaaaaaaaaa'
   const id = 'lnkedit001'
   const rkey = 'rkedit'
@@ -1475,8 +1446,6 @@ console.log('--- record edit sync (manager save via record-mode /complete) ---')
   )
 }
 {
-  // Legacy active link (no record yet): attaching a record must set
-  // record_cid and sync metadata without changing the bound thread.
   const id = 'lnkattach1'
   const rkey = 'rkattach'
   addRow(id, {
@@ -1502,7 +1471,6 @@ console.log('--- record edit sync (manager save via record-mode /complete) ---')
   )
 }
 {
-  // A record for a different thread must not re-bind an active link.
   const id = 'lnkrebind1'
   const rkeyOld = 'rkrebold'
   const rkeyNew = 'rkrebnew'
@@ -1523,8 +1491,6 @@ console.log('--- record edit sync (manager save via record-mode /complete) ---')
 
 console.log('--- pending lazy self-repair (viewer GET) ---')
 {
-  // Published-but-unbound link: the root post carries the URL, so the first
-  // reader visit must finish the bind and serve the comic.
   const id = 'lnkrepair1'
   const rkey = 'rkrepair1'
   addRow(id, { created_at: now() - 600 })
@@ -1555,8 +1521,7 @@ console.log('--- pending lazy self-repair (viewer GET) ---')
   ok('no further feed scans once active', feedCalls() === afterRepair)
 }
 {
-  // Replies, text-only shares, and reposts mentioning the URL must never
-  // bind: only a root post with images qualifies (the upload's post 1).
+  // Only an original root post with images proves ownership of the pending link.
   const id = 'lnkrepair2'
   addRow(id, { created_at: now() - 600 })
   feeds.set(AUTHOR, [
@@ -1578,8 +1543,7 @@ console.log('--- pending lazy self-repair (viewer GET) ---')
   ok('row still pending after decoys', db.rows.get(id).state === 'pending')
 }
 {
-  // Two qualifying posts: the OLDEST one (the comic root, posted right after
-  // the reservation) must win over a later share post with images.
+  // A later share can also contain images and the viewer URL.
   const id = 'lnkrepair3'
   const rkeyRoot = 'rkrep3root'
   addRow(id, { created_at: now() - 7200 })
@@ -1605,8 +1569,6 @@ console.log('--- pending lazy self-repair (viewer GET) ---')
   )
 }
 {
-  // The scan costs upstream calls, so unmatched pendings are tightly rate
-  // limited per link.
   const id = 'lnkrepair4'
   addRow(id, { created_at: now() - 600 })
   feeds.set(AUTHOR, [])
@@ -1621,8 +1583,7 @@ console.log('--- pending lazy self-repair (viewer GET) ---')
 
 console.log('--- quota (creation-path purge + atomic guard) ---')
 {
-  // Expired reservations are purged by the creation path itself, not only by
-  // the /manage list — an author who never opens /manage cannot accumulate.
+  // Purging must also work for authors who never open /manage.
   addRow('lnkqexp001', { created_at: 100 })
   const res = await post(
     '/api/manga/reserve',
@@ -1671,7 +1632,6 @@ console.log('--- quota (creation-path purge + atomic guard) ---')
   )
   await expectResponse('generate (new thread) at quota -> 429', resNew, 429, '100件')
 
-  // Re-fetching an existing link must stay possible at the limit.
   const resReuse = await post(
     '/api/manga/generate',
     { postUrl: postUri('rkgen1'), startSide: 'right' },

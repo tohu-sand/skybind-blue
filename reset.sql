@@ -1,7 +1,5 @@
--- DESTRUCTIVE: drops and recreates manga_links, deleting every row.
--- Intended for resetting a LOCAL development database only (npm run db:reset:local).
--- Never run this against the remote/production database: it permanently destroys
--- every id -> original_post_uri mapping and breaks all previously shared links.
+-- Local reset only (npm run db:reset:local): deletes all links and consumed JWT nonces.
+-- Never run against production; deleting link mappings breaks shared URLs.
 DROP TABLE IF EXISTS manga_links;
 CREATE TABLE manga_links (
   id TEXT PRIMARY KEY,

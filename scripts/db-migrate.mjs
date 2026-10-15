@@ -1,22 +1,13 @@
-// Idempotent D1 migration: brings an existing manga_links table up to the
-// current schema. SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
-// so this script inspects the table first and only adds what is missing.
-// Safe to run any number of times, locally or remotely.
-//
-//   node scripts/db-migrate.mjs           # local D1
-//   node scripts/db-migrate.mjs --remote  # production D1 (take a backup first!)
-
 import { execFileSync } from 'node:child_process'
 
 const DB_NAME = 'skybind-db'
 const remote = process.argv.includes('--remote')
 const target = remote ? '--remote' : '--local'
 
-// column name -> ALTER clause. New columns must be nullable or have a default
-// so the ALTER applies instantly without rewriting existing rows.
+// Added columns must be nullable or have a default for existing rows.
 const WANTED_COLUMNS = new Map([
   ['record_cid', 'record_cid TEXT'],
-  ["state", "state TEXT NOT NULL DEFAULT 'active'"],
+  ['state', "state TEXT NOT NULL DEFAULT 'active'"],
 ])
 
 const d1 = (command) => {
@@ -25,7 +16,7 @@ const d1 = (command) => {
     ['wrangler', 'd1', 'execute', DB_NAME, target, '--command', command, '--json'],
     { encoding: 'utf8' },
   )
-  // wrangler prints a JSON array of result sets after any banner noise.
+  // Wrangler may print a banner before the JSON result array.
   const start = out.indexOf('[')
   if (start === -1) {
     throw new Error(`Unexpected wrangler output:\n${out}`)
@@ -41,7 +32,6 @@ if (remote) {
   )
 }
 
-// Tables that are safe to create outright when missing (idempotent DDL).
 d1(`CREATE TABLE IF NOT EXISTS service_auth_jti (
   jti TEXT PRIMARY KEY,
   author_did TEXT NOT NULL,
@@ -52,6 +42,7 @@ d1(
 )
 console.log('- service_auth_jti: ensured')
 
+// SQLite has no ADD COLUMN IF NOT EXISTS; inspect columns before adding them.
 const info = d1('PRAGMA table_info(manga_links)')
 const existing = new Set(
   (info[0]?.results ?? []).map((column) => column.name),
@@ -76,8 +67,7 @@ d1(
 )
 console.log('- idx_manga_author_created: ensured')
 
-// The 'active' default is wrong for reserved-but-never-completed rows; fix them.
-// Idempotent: matching rows are already exactly this value after the first run.
+// Reservations must stay pending even when the column default is 'active'.
 const fixed = d1(
   "UPDATE manga_links SET state = 'pending' WHERE original_post_uri = 'pending' AND state != 'pending'",
 )

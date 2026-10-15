@@ -26,31 +26,23 @@ export default function ImageFrame({
   priority = false,
   frame = 'single',
 }: ImageFrameProps) {
-  const [loaded, setLoaded] = useState(false)
+  const [result, setResult] = useState<{
+    url: string | undefined
+    status: 'loading' | 'loaded' | 'error'
+  }>({ url: image?.url, status: 'loading' })
+  const [retryCount, setRetryCount] = useState(0)
   const imgRef = useRef<HTMLImageElement | null>(null)
+  const url = image?.url
+  const status = result.url === url ? result.status : 'loading'
 
   useEffect(() => {
-    // Check if image is already cached before resetting loaded state
-    if (image?.url) {
-      const testImg = new Image()
-      testImg.src = image.url
-      if (testImg.complete && testImg.naturalWidth > 0) {
-        setLoaded(true)
-        return
-      }
-    }
-    setLoaded(false)
-  }, [image?.url])
-
-  useEffect(() => {
+    // Cached images may finish before React receives their load/error event.
     const img = imgRef.current
-    if (!img) {
-      return
-    }
-    if (img.complete && img.naturalWidth > 0) {
-      setLoaded(true)
-    }
-  }, [image?.url])
+    setResult({
+      url,
+      status: img?.complete ? (img.naturalWidth > 0 ? 'loaded' : 'error') : 'loading',
+    })
+  }, [url, retryCount])
 
   const { frameClass, backgroundClass, placeholderClass } = getFrameStyles(frame)
   const objectPositionClass = getObjectPositionClass(frame)
@@ -70,22 +62,41 @@ export default function ImageFrame({
       className={`relative h-full w-full overflow-hidden ${backgroundClass} backdrop-blur-sm ${frameClass}`}
     >
       <img
+        key={`${image.url}:${retryCount}`}
         ref={imgRef}
         src={image.url}
         alt={image.alt || `Manga page ${index + 1}`}
         className={`h-full w-full select-none object-contain ${objectPositionClass} transition-opacity duration-500 ${
-          loaded ? 'opacity-100' : 'opacity-0'
+          status === 'loaded' ? 'opacity-100' : 'opacity-0'
         } ${isBlurred ? 'blur-2xl scale-[1.02]' : ''}`}
         loading={loading}
         fetchPriority={fetchPriority}
         decoding="async"
-        onLoad={() => setLoaded(true)}
-        onError={() => setLoaded(true)}
+        onLoad={() => setResult({ url, status: 'loaded' })}
+        onError={() => setResult({ url, status: 'error' })}
         draggable={false}
       />
-      {!loaded && (
+      {status === 'loading' && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/40">
           <div className="h-2 w-16 rounded-full bg-ink/20 animate-breath" />
+        </div>
+      )}
+      {status === 'error' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-paper/90 px-4 text-center">
+          <p role="status" className="text-xs text-ink/70">画像を読み込めませんでした</p>
+          <button
+            type="button"
+            onPointerDown={(event) => event.stopPropagation()}
+            onPointerUp={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation()
+              setResult({ url, status: 'loading' })
+              setRetryCount((count) => count + 1)
+            }}
+            className="rounded-full border border-ink/15 bg-paper px-5 py-2 text-xs text-ink transition hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+          >
+            再読み込み
+          </button>
         </div>
       )}
       {isBlurred && (

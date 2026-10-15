@@ -8,8 +8,6 @@ const LAST_UPDATED = '2026-08-06'
 const linkClass =
   'underline decoration-ink/30 underline-offset-4 transition hover:text-ink hover:decoration-ink/60'
 
-// Every section is a heading + one bullet list (one item = one fact), so the
-// whole document reads in a single consistent rhythm.
 const Section = ({ title, children }: { title: string; children: ReactNode }) => (
   <section>
     <h2 className="text-sm font-semibold text-ink">{title}</h2>

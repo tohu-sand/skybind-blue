@@ -1,17 +1,11 @@
-// Shared between the browser uploader (record writer) and the Pages Function
-// (record verifier). Keep in sync with lexicons/blue/skybind/comic.json.
+// Keep in sync with lexicons/blue/skybind/comic.json.
 
 export const COMIC_COLLECTION = 'blue.skybind.comic'
 
-// Service auth: the browser asks the user's PDS for a short-lived JWT with
-// this audience/method, and the API verifies it to prove account control.
-// The audience is a DID *service reference* (DID + service id fragment) as
-// required by the rpc permission scope; it must match the service entry in
-// public/.well-known/did.json and the scope in public/client-metadata.json
-// (where the '#' is percent-encoded as %23).
+// RPC scopes require a DID service reference. Match public/.well-known/did.json
+// and public/client-metadata.json, where the fragment separator is encoded as %23.
 export const SERVICE_AUTH_AUD = 'did:web:skybind.blue#skybind_api'
-// Capability identifier for link management, not a published XRPC method:
-// it only scopes the service-auth token to SkyBind's link endpoints.
+// Token scope for link management; this is not a published XRPC method.
 export const SERVICE_AUTH_LXM = 'blue.skybind.manageLink'
 
 export type StrongRef = {

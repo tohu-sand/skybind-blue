@@ -1,7 +1,5 @@
-// This module deliberately avoids @atproto/api: the worker only needs two
-// public XRPC GET queries, and the SDK's ESM build uses import attributes
-// that the Pages Functions bundler (wrangler 3 / esbuild) cannot parse.
-// The browser-side uploader keeps using the SDK.
+// Use direct XRPC requests because the Pages Functions bundler cannot parse
+// the @atproto SDK's import attributes.
 
 import { fetchDidDocument, isPublicHostname, readBodyCapped } from './did'
 
@@ -18,11 +16,10 @@ export type MangaThreadResult = {
   originalPostUri: string
   hasSensitive: boolean
   author: AuthorProfile
-  // Chain posts in reading order (root first), for blue.skybind.comic `posts`.
+  // Reading order, starting with the root post.
   posts: { uri: string; cid: string }[]
   rootCid: string | null
-  // Sensitive self-label values across the WHOLE chain (a child-only R18 post
-  // must still mark the comic), for mirroring onto the record.
+  // Include labels from replies so they apply to the whole comic record.
   sensitiveSelfLabels: string[]
 }
 
@@ -62,13 +59,9 @@ const isThreadViewPost = (value: unknown): value is ThreadViewPost => {
   )
 }
 
-// Upstream hosts include author-controlled PDSes, so responses are treated as
-// hostile: redirects are never followed (they could point at an internal
-// address), a timeout covers the body read too, and the bytes actually
-// consumed are capped.
+// Author-controlled PDSes require bounded reads and no redirects to internal hosts.
 const XRPC_TIMEOUT_MS = 10_000
-// Public-API thread chunks are the largest legitimate payloads (deep reply
-// arrays reach a few hundred KB); 5 MB is far above that yet bounds memory.
+// Allow large thread responses while bounding memory use.
 const XRPC_MAX_BYTES = 5 * 1024 * 1024
 const XRPC_ERROR_MAX_BYTES = 64 * 1024
 
@@ -101,7 +94,7 @@ const xrpcGet = async <T,>(
           ),
         ) as { error?: string; message?: string }
       } catch {
-        // not JSON (or oversized); fall through to the generic message
+        // Use the generic message when the error body cannot be read.
       }
       const error = new Error(
         body?.message || `${nsid} failed (${response.status})`,
@@ -132,11 +125,8 @@ const toTimestamp = (post: {
   return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed
 }
 
-// Posts expose pages through two embed shapes:
-//   - app.bsky.embed.images (1-4 photos): `images[]`, each with `thumb`/`fullsize`
-//   - app.bsky.embed.gallery (5+ photo carousels, added 2026): `items[]`, each
-//     with `thumbnail`/`fullsize`
-// Both always carry `fullsize`. recordWithMedia nests either shape under `media`.
+// Image embeds use images/thumb; galleries use items/thumbnail.
+// Both provide fullsize and may be nested under recordWithMedia.media.
 type EmbedImageView = { fullsize?: string; thumb?: string; thumbnail?: string }
 type EmbedView = {
   $type?: string
@@ -389,30 +379,22 @@ export const fetchMangaThread = async (
   }
 }
 
-// --- pending link self-repair ------------------------------------------------
-// The uploader publishes the viewer URL in the ROOT post before the final
-// bind call, so a crashed run can leave a live published URL pointing at a
-// pending row. Everything needed to finish the bind is public: scan the row
-// author's own feed for a root post with images whose text carries the URL.
-// (Same ownership proof as legacy /complete: only the author can have posted
-// it to their own repo.)
-
 const REPAIR_FEED_PAGE_CAP = 5
 const REPAIR_SINCE_MARGIN_MS = 60 * 60 * 1000
 
+// Recover interrupted uploads from the author's root image post containing the URL.
 export const findPublishedLinkPost = async (
   agent: BskyClient,
   authorDid: string,
   linkId: string,
-  // Reservation time: posts older than this (minus margin) cannot be the one.
+  // Reservation time; older posts are excluded, allowing for clock skew.
   sinceEpochSec: number | null,
 ): Promise<string | null> => {
   const needle = `/v/${linkId}`
   const sinceMs =
     sinceEpochSec !== null ? sinceEpochSec * 1000 - REPAIR_SINCE_MARGIN_MS : null
   let cursor: string | undefined
-  // The upload posts the URL within minutes of the reservation, so the OLDEST
-  // qualifying post is the comic root; later shares/reposts must lose.
+  // Prefer the oldest match to avoid binding to a later share of the same URL.
   let best: { uri: string; ts: number } | null = null
 
   for (let page = 0; page < REPAIR_FEED_PAGE_CAP; page += 1) {
@@ -436,7 +418,7 @@ export const findPublishedLinkPost = async (
     for (const item of feed) {
       const entry = item as { post?: PostView; reason?: unknown }
       if (entry.reason || !entry.post) {
-        continue // repost of someone else's (or own) post
+        continue
       }
       const post = entry.post
       if (post.author?.did !== authorDid) {
@@ -451,13 +433,13 @@ export const findPublishedLinkPost = async (
         continue
       }
       if (record?.reply) {
-        continue // the URL lives in the root post only
+        continue
       }
       if (typeof record?.text !== 'string' || !record.text.includes(needle)) {
         continue
       }
       if (!extractImages(post.embed).length) {
-        continue // text-only shares of the URL are not the comic
+        continue
       }
       const orderTs = Number.isNaN(ts) ? Number.MAX_SAFE_INTEGER : ts
       if (!best || orderTs < best.ts) {
@@ -476,7 +458,6 @@ export const findPublishedLinkPost = async (
   return best?.uri ?? null
 }
 
-// Single-post fetch used by the /complete verification paths.
 export type PostSummary = {
   text: string
   cid: string | null
@@ -503,16 +484,8 @@ export const fetchPostSummary = async (
   }
 }
 
-// --- blue.skybind.comic record verification helpers -------------------------
-// /complete proves account control by fetching the comic record from the
-// author's own PDS: only the account holder can have written it there.
-
 export const resolvePdsEndpoint = async (did: string): Promise<string> => {
-  // The shared resolver validates the DID before any network access (SSRF),
-  // never follows redirects, bounds the fetch by timeout and size, and caches
-  // documents — so repeated /complete attempts don't re-resolve per request.
   const { doc } = await fetchDidDocument(did)
-  // Per the DID spec, match the PDS service by both id and type.
   const service = doc.service?.find(
     (entry) =>
       (entry?.id === '#atproto_pds' || entry?.id === `${did}#atproto_pds`) &&
@@ -535,10 +508,7 @@ export const resolvePdsEndpoint = async (did: string): Promise<string> => {
     parsed.search ||
     parsed.hash ||
     (parsed.pathname !== '/' && parsed.pathname !== '') ||
-    // The endpoint is read from an attacker-influencable document, so the
-    // host must look public: no IP literals (169.254.169.254, [::1], ...),
-    // localhost, or reserved TLDs. Explicit ports stay allowed — the atproto
-    // DID spec permits them for PDS service endpoints.
+    // Require a public hostname; the atproto DID spec permits explicit PDS ports.
     !isPublicHostname(parsed.hostname)
   ) {
     throw new Error('PDSエンドポイントが不正です。')

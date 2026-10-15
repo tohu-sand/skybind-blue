@@ -1,14 +1,5 @@
-// Inter-service auth verification: the browser calls
-// com.atproto.server.getServiceAuth on the user's own PDS, which mints a
-// short-lived JWT signed with the account's atproto signing key. Verifying
-// that signature against the DID document proves the caller controls the DID,
-// without any user token ever reaching this server.
-//
-// Like manga.ts, this module avoids @atproto/* server-side packages (the
-// Pages Functions bundler cannot parse their import attributes) and uses the
-// small pure-JS @noble/curves + @scure/base instead.
-//
-// Spec: https://atproto.com/specs/xrpc#inter-service-authentication-jwt
+// Verify PDS-issued JWTs against the account's DID signing key.
+// https://atproto.com/specs/xrpc#inter-service-authentication-jwt
 
 import { p256 } from '@noble/curves/nist.js'
 import { secp256k1 } from '@noble/curves/secp256k1.js'
@@ -18,16 +9,12 @@ import { SERVICE_AUTH_AUD } from '../shared/comicRecord'
 import { DID_DOC_CACHE_MAX, fetchDidDocument, type DidDocument } from './did'
 
 const CLOCK_SKEW_SECONDS = 60
-// The spec recommends ~60s tokens; allow headroom for slow uploads but keep
-// stolen tokens short-lived.
+// Allow headroom beyond the spec's recommended 60 seconds for slow uploads.
 const MAX_TOKEN_LIFETIME_SECONDS = 15 * 60
-// Retention for consumed nonces; anything older cannot be replayed because
-// its `exp` has long passed.
+// Retain consumed nonces until their tokens are outside the accepted lifetime.
 const JTI_RETENTION_SECONDS = MAX_TOKEN_LIFETIME_SECONDS + CLOCK_SKEW_SECONDS
 
-// Cooldown for the key-rotation cache bypass: without it, a stream of
-// bad-signature tokens for one cached DID would trigger a forced refetch per
-// request (outbound amplification).
+// Limit forced DID fetches triggered by invalid signatures.
 const FORCE_REFETCH_COOLDOWN_MS = 60 * 1000
 const forcedRefetchAt = new Map<string, number>()
 
@@ -52,9 +39,6 @@ const decodeJsonSegment = (segment: string): Record<string, unknown> => {
   }
   return parsed as Record<string, unknown>
 }
-
-// DID syntax validation, SSRF guards and the bounded document fetch live in
-// ./did (shared with the comic-record verification path).
 
 // did:key-style multibase: 'z' + base58btc(multicodec varint + compressed key)
 const parseSigningKey = (
@@ -83,7 +67,6 @@ const getAtprotoSigningKey = (doc: DidDocument, did: string) => {
   if (method.type !== 'Multikey') {
     throw new Error('署名鍵の型が不正です。')
   }
-  // controller is a required field per the atproto DID spec.
   if (method.controller !== did) {
     throw new Error('署名鍵のcontrollerが一致しません。')
   }
@@ -101,13 +84,11 @@ const verifySignature = (
   signature: Uint8Array,
 ) => {
   const { curve, key } = getAtprotoSigningKey(doc, did)
-  // Reject algorithm/key mismatches outright (no alg-confusion downgrade).
   if (curve !== alg) {
     throw new Error('署名アルゴリズムが鍵と一致しません。')
   }
   const verifier = curve === 'ES256K' ? secp256k1 : p256
-  // lowS stays at its default (true): atproto requires low-S signatures, and
-  // accepting high-S would make signatures malleable (jti replay bypass).
+  // Keep the default lowS: true; atproto requires low-S signatures.
   return verifier.verify(signature, msgHash, key, { prehash: false })
 }
 
@@ -128,7 +109,6 @@ export const verifyServiceJwt = async (
   const [headerSeg, payloadSeg, sigSeg] = segments
 
   const header = decodeJsonSegment(headerSeg)
-  // typ is required by the inter-service auth spec, and must be exactly JWT.
   if (header.typ !== 'JWT') {
     throw new Error('typが不正です。')
   }
@@ -138,7 +118,7 @@ export const verifyServiceJwt = async (
   if (header.crit !== undefined) {
     throw new Error('未対応のJWTヘッダーです。')
   }
-  // Per spec, kid is either omitted or a fragment-only key id.
+  // The spec requires kid to be omitted or a fragment-only key ID.
   if (header.kid !== undefined && header.kid !== '#atproto') {
     throw new Error('kidが不正です。')
   }
@@ -155,8 +135,7 @@ export const verifyServiceJwt = async (
     throw new Error('lxmが一致しません。')
   }
 
-  // Reject non-finite / non-integer timestamps: `exp: 1e309` parses as
-  // Infinity and would otherwise never expire.
+  // JSON numbers such as 1e309 parse as Infinity and must not bypass expiry.
   if (!isSecondsTimestamp(payload.exp) || !isSecondsTimestamp(payload.iat)) {
     throw new Error('exp/iatが不正です。')
   }
@@ -176,7 +155,7 @@ export const verifyServiceJwt = async (
     throw new Error('トークンの有効期限が切れています。')
   }
 
-  // Required nonce: consumed once by the caller to prevent replay.
+  // The caller must consume this nonce to prevent replay.
   const jti = typeof payload.jti === 'string' ? payload.jti : ''
   if (!jti || jti.length > 128) {
     throw new Error('jtiが不正です。')
@@ -197,12 +176,9 @@ export const verifyServiceJwt = async (
     if (!fromCache) {
       throw err
     }
-    // A cached document may simply be stale; retry below before failing.
     console.error('signature check against cached DID document failed:', err)
   }
-  // Key-rotation fallback: re-resolve once before rejecting. Only makes
-  // sense for cached documents (a fresh one is already current), and only
-  // outside the per-DID cooldown.
+  // A cached key may predate rotation; refresh at most once per cooldown.
   if (!valid && fromCache) {
     const lastForced = forcedRefetchAt.get(iss) ?? 0
     if (Date.now() - lastForced > FORCE_REFETCH_COOLDOWN_MS) {
@@ -224,8 +200,7 @@ export const verifyServiceJwt = async (
   return { did: iss, jti, expiresAt: exp }
 }
 
-// Atomically consumes (iss, jti). Returns false when the nonce was already
-// used, i.e. the token is being replayed.
+// Consume (iss, jti) atomically; false indicates replay.
 const consumeJti = async (
   db: D1Database,
   did: string,
@@ -247,7 +222,6 @@ export const purgeExpiredJti = (db: D1Database) =>
     .bind(Math.floor(Date.now() / 1000) - JTI_RETENTION_SECONDS)
     .run()
 
-// Returns the cryptographically verified DID of the caller, or throws 401.
 export const requireServiceAuth = async (
   authorization: string | undefined,
   lxm: string,

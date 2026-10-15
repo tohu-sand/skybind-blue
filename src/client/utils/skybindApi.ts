@@ -71,9 +71,7 @@ export async function withRetry<T>(
   }
 }
 
-// Short-lived proof of account control, minted by the user's own PDS and
-// verified by the SkyBind API. Minting fails on sessions that predate the
-// rpc scope — those users must re-login.
+// Sessions without the service-auth RPC scope must log in again.
 export const getServiceAuthHeader = async (agent: Agent): Promise<string> => {
   try {
     const response = await agent.com.atproto.server.getServiceAuth({
@@ -87,8 +85,7 @@ export const getServiceAuthHeader = async (agent: Agent): Promise<string> => {
   }
 }
 
-// Best-effort sidecar record in the author's own repo (rkey = root post rkey),
-// so third-party clients can look the comic up straight from the post.
+// Match the root post's rkey so clients can find the comic record from the post.
 export const putComicRecord = async (
   agent: Agent,
   did: string,
@@ -101,7 +98,7 @@ export const putComicRecord = async (
     language?: string
     labelValues?: string[]
     pageCount?: number
-    // Preserved across edits: the record keeps its original creation time.
+    // Preserve the original creation time when editing.
     createdAt?: string
   },
 ) => {
@@ -172,8 +169,7 @@ export const completeLink = async (
         body: JSON.stringify(body),
       })
 
-      // WAF/edge errors may be HTML: never let JSON parsing swallow the
-      // HTTP status (it decides whether the attempt is retriable).
+      // HTML error responses still need their HTTP status for retry decisions.
       const data = (await response.json().catch(() => null)) as
         | (CompleteResponse & { error?: string })
         | null

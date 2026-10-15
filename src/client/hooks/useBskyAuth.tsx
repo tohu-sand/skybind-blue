@@ -29,8 +29,7 @@ type AuthContextValue = {
   profile: AuthProfile | null
   status: AuthStatus
   error: string | null
-  // In-app path carried through the OAuth round trip (login started from a
-  // page other than Home); null for plain logins and restored sessions.
+  // OAuth return path; null for logins without a destination and restored sessions.
   postLoginPath: string | null
   signIn: (options?: { returnTo?: string }) => Promise<void>
   signOut: () => Promise<void>
@@ -44,8 +43,7 @@ const getEnv = (key: string, fallback: string) =>
 const hasOAuthParams = (params: URLSearchParams) =>
   params.has('state') && (params.has('code') || params.has('error'))
 
-// The OAuth state string round-trips through the authorization server, so
-// only accept a plain in-app path back (no scheme-relative // redirects).
+// OAuth state is untrusted; allow only in-app return paths.
 const parseReturnTo = (state: string | null | undefined): string | null => {
   if (!state) {
     return null
@@ -61,7 +59,7 @@ const parseReturnTo = (state: string | null | undefined): string | null => {
       return returnTo
     }
   } catch {
-    // Unknown state payload: ignore.
+    // Unrecognized OAuth state has no return path.
   }
   return null
 }
