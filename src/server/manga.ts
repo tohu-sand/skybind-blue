@@ -13,6 +13,7 @@ type AuthorProfile = {
 export type MangaThreadResult = {
   pages: string[]
   authorDid: string
+  // The AppView's canonical (DID-form) URI of the requested post.
   originalPostUri: string
   hasSensitive: boolean
   author: AuthorProfile
@@ -272,6 +273,7 @@ export const fetchMangaThread = async (
   const visited = new Set<string>()
   let authorDid = ''
   let author: AuthorProfile | null = null
+  let rootUri: string | null = null
   let rootCid: string | null = null
   let currentUri: string | null = uri
   let steps = 0
@@ -296,6 +298,14 @@ export const fetchMangaThread = async (
 
     if (!isThreadViewPost(response.thread)) {
       throw new Error('スレッドが取得できませんでした。')
+    }
+
+    // The first response anchors on the requested post. The AppView resolves
+    // handle-form inputs, so take the root's identity from its answer.
+    if (rootUri === null) {
+      rootUri = response.thread.post.uri
+      rootCid =
+        typeof response.thread.post.cid === 'string' ? response.thread.post.cid : null
     }
 
     let current: ThreadViewPost | null = response.thread
@@ -324,9 +334,6 @@ export const fetchMangaThread = async (
         pages.push(...extractImages(current.post.embed))
         if (typeof current.post.cid === 'string') {
           posts.push({ uri: current.post.uri, cid: current.post.cid })
-        }
-        if (!rootCid && current.post.uri === uri) {
-          rootCid = current.post.cid ?? null
         }
         for (const val of extractSelfLabelValues(current.post.record)) {
           if (SENSITIVE_LABELS.has(val)) {
@@ -370,7 +377,7 @@ export const fetchMangaThread = async (
   return {
     pages,
     authorDid,
-    originalPostUri: uri,
+    originalPostUri: rootUri ?? uri,
     hasSensitive,
     author: author ?? { did: authorDid },
     posts,

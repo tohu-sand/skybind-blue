@@ -7,6 +7,7 @@ import {
   useState,
   type PointerEvent,
 } from 'react'
+import { loadFonts } from '../fonts'
 import useMediaQuery from '../hooks/useMediaQuery'
 import AuthorFrame, { type AuthorPage } from './AuthorFrame'
 import ImageFrame, { type ImagePage } from './ImageFrame'
@@ -51,6 +52,12 @@ export default function Reader({
   const [nsfwRevealed, setNsfwRevealed] = useState(false)
   const leftStartSpread = isSpread && startOnLeft
   const preloadedRef = useRef<Set<string>>(new Set())
+  // Image URLs that finished loading or failed. Entries stay valid across page
+  // changes, and frames report only once, so this is never cleared.
+  const [settledUrls, setSettledUrls] = useState<ReadonlySet<string>>(() => new Set())
+  const markSettled = useCallback((url: string) => {
+    setSettledUrls((prev) => (prev.has(url) ? prev : new Set(prev).add(url)))
+  }, [])
   const previousViewRef = useRef<{
     pages: ReaderPage[]
     initialPage: number | undefined
@@ -184,6 +191,19 @@ export default function Reader({
     [pages, toLogicalIndex],
   )
 
+  // Other image requests wait for the pages on screen: started together, they
+  // split the connection and the page being read arrives later.
+  const visibleSettled = useMemo(() => {
+    const visible = isSpread ? [getPageAt(index), getPageAt(index + 1)] : [getPageAt(index)]
+    return visible.every((page) => page?.type !== 'image' || settledUrls.has(page.url))
+  }, [getPageAt, index, isSpread, settledUrls])
+
+  useEffect(() => {
+    if (visibleSettled) {
+      loadFonts()
+    }
+  }, [visibleSettled])
+
   const navigate = useCallback((direction: -1 | 1, animate = false) => {
     // Refs block overlapping events before React commits state updates.
     if (animationTimerRef.current !== null || pointerState.current.pointerId !== null) {
@@ -226,6 +246,9 @@ export default function Reader({
   }, [navigate])
 
   useEffect(() => {
+    if (!visibleSettled) {
+      return undefined
+    }
     const schedule =
       typeof window !== 'undefined' && 'requestIdleCallback' in window
         ? (window as Window & {
@@ -256,7 +279,7 @@ export default function Reader({
     })
 
     return () => cancel(id)
-  }, [getPageAt, index, isSpread])
+  }, [getPageAt, index, isSpread, visibleSettled])
 
   const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (!pages.length || event.button !== 0) {
@@ -347,8 +370,12 @@ export default function Reader({
     setNsfwRevealed(true)
   }
 
-  const current = getPageAt(index)
-  const next = isSpread ? getPageAt(index + 1) : null
+  // Frames are keyed by page, not by slot, and the pages around the visible
+  // ones stay mounted. Turning the page then moves an <img> that has already
+  // loaded; recreating it would blank the page until it loads and fades in.
+  const mountedIndices = isSpread
+    ? [index - 2, index - 1, index, index + 1, index + 2, index + 3]
+    : [index - 1, index, index + 1]
 
   const visibleIndices = isSpread ? [index, index + 1] : [index]
   const visibleLabels = visibleIndices
@@ -371,6 +398,7 @@ export default function Reader({
     viewIndex: number,
     priority = false,
     frame: FrameVariant = 'single',
+    deferred = false,
   ) => {
     if (!page) {
       return <ImageFrame image={null} index={viewIndex} frame={frame} />
@@ -387,6 +415,8 @@ export default function Reader({
         onReveal={revealAllNsfw}
         priority={priority}
         frame={frame}
+        deferred={deferred}
+        onSettled={markSettled}
       />
     )
   }
@@ -418,9 +448,32 @@ export default function Reader({
         >
           {isSpread ? (
             <div className="h-full w-full overflow-hidden rounded-2xl border border-ink/10 bg-white/70 shadow-frame">
-              <div className="grid h-full w-full grid-cols-2 gap-0">
-                {renderPage(next, index + 1, true, 'spread-left')}
-                {renderPage(current, index, true, 'spread-right')}
+              <div className="relative h-full w-full">
+                {mountedIndices.map((viewIndex) => {
+                  const page = getPageAt(viewIndex)
+                  const offset = viewIndex - index
+                  const visible = offset === 0 || offset === 1
+                  if (!page && !visible) {
+                    return null
+                  }
+                  const isLeft = Math.abs(offset) % 2 === 1
+                  return (
+                    <div
+                      key={viewIndex}
+                      className={`absolute inset-y-0 w-1/2 ${isLeft ? 'left-0' : 'left-1/2'} ${
+                        visible ? '' : 'invisible'
+                      }`}
+                    >
+                      {renderPage(
+                        page,
+                        viewIndex,
+                        visible,
+                        isLeft ? 'spread-left' : 'spread-right',
+                        !visible && !visibleSettled,
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             </div>
           ) : (
@@ -431,27 +484,35 @@ export default function Reader({
                 style={{ aspectRatio: '0.7' }}
               >
                 <div
-                  className="flex h-full"
+                  className="relative h-full w-full"
                   style={{
                     transform: `translateX(${swipeOffset}px)`,
                     transition: isAnimating ? 'transform 200ms ease-out' : 'none',
                   }}
                 >
-                  <div className="absolute right-full h-full w-full flex-shrink-0">
-                    <div className="flex h-full w-full items-center justify-center">
-                      {index < pages.length - 1 && renderPage(pages[index + 1], index + 1, false, 'swipe-left')}
-                    </div>
-                  </div>
-                  <div className="h-full w-full flex-shrink-0">
-                    <div className="flex h-full w-full items-center justify-center">
-                      {renderPage(current, index, true, 'swipe-right')}
-                    </div>
-                  </div>
-                  <div className="absolute left-full h-full w-full flex-shrink-0">
-                    <div className="flex h-full w-full items-center justify-center">
-                      {index > 0 && renderPage(pages[index - 1], index - 1, false, 'swipe-left')}
-                    </div>
-                  </div>
+                  {mountedIndices.map((viewIndex) => {
+                    const page = getPageAt(viewIndex)
+                    const offset = viewIndex - index
+                    if (!page && offset !== 0) {
+                      return null
+                    }
+                    // The next page sits to the left: the book reads right to left.
+                    return (
+                      <div
+                        key={viewIndex}
+                        className="absolute inset-y-0 w-full"
+                        style={{ left: `${-offset * 100}%` }}
+                      >
+                        {renderPage(
+                          page,
+                          viewIndex,
+                          offset === 0,
+                          'swipe-right',
+                          offset !== 0 && !visibleSettled,
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             </div>

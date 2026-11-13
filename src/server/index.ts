@@ -249,7 +249,12 @@ app.post('/api/manga/generate', async (c) => {
     }
     return c.json({ error: 'スレッド取得に失敗しました。' }, 502)
   }
-  if (thread.authorDid !== authorDid) {
+  // Store only a DID-form URI in the caller's repo. A handle-form URI would be
+  // re-resolved on every view and follow the handle to whoever holds it later.
+  if (
+    thread.authorDid !== authorDid ||
+    getPostAuthorDid(thread.originalPostUri) !== authorDid
+  ) {
     return c.json({ error: '作者本人のみURLを生成できます。' }, 403)
   }
 
@@ -753,10 +758,17 @@ const tryRepairPendingLink = async (
 
 app.get('/api/manga/:id', async (c) => {
   const id = c.req.param('id')
+  // Malformed IDs cannot exist; answer before touching the cache or DB.
+  if (!LINK_ID_PATTERN.test(id)) {
+    return c.json({ error: 'リンクが見つかりませんでした。' }, 404)
+  }
 
   // The shared DOM types omit Workers' caches.default.
   const cache = (caches as unknown as { default: Cache }).default
-  const cacheKey = new Request(new URL(c.req.url).toString(), { method: 'GET' })
+  // Key on the path alone so query strings cannot bypass the cache.
+  const cacheKey = new Request(new URL(`/api/manga/${id}`, c.req.url).toString(), {
+    method: 'GET',
+  })
   const cached = await cache.match(cacheKey)
   if (cached) {
     return cached

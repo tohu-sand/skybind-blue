@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import Reader from '../components/Reader'
 import StatusScreen from '../components/StatusScreen'
+import { loadFonts } from '../fonts'
 import {
   buildReaderPages,
   readErrorMessage,
@@ -59,6 +60,26 @@ export default function Viewer() {
   }, [id, retryCount])
 
   const pages = useMemo(() => (data ? buildReaderPages(data) : []), [data])
+
+  const title = data?.title?.trim()
+  useEffect(() => {
+    if (!title) {
+      return undefined
+    }
+    const previous = document.title
+    document.title = `${title} - SkyBind`
+    return () => {
+      document.title = previous
+    }
+  }, [title])
+
+  // The reader requests fonts after its first page; these states never show one.
+  const showsReader = status === 'loading' || (status === 'ready' && pages.length > 0)
+  useEffect(() => {
+    if (!showsReader) {
+      loadFonts()
+    }
+  }, [showsReader])
 
   if (status === 'loading') {
     return (

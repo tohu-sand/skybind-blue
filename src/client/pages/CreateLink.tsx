@@ -12,6 +12,7 @@ import type { StrongRef } from '../../shared/comicRecord'
 import ManageGearLink from '../components/ManageGearLink'
 import StatusScreen from '../components/StatusScreen'
 import { useBskyAuth } from '../hooks/useBskyAuth'
+import useWakeLock from '../hooks/useWakeLock'
 import { compressForBluesky } from '../utils/blueskyImage'
 import { toBskyPostUrl } from '../utils/mangaReader'
 import {
@@ -542,6 +543,9 @@ export default function CreateLink() {
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
   }, [uploading])
+
+  // A sleeping phone stalls the upload and can leave the thread half posted.
+  useWakeLock(uploading)
 
   useEffect(() => {
     if (!debugMode) {

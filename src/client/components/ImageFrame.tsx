@@ -16,6 +16,10 @@ type ImageFrameProps = {
   onReveal?: () => void
   priority?: boolean
   frame?: FrameVariant
+  // Hold the request back while a higher-priority page is still loading.
+  deferred?: boolean
+  // Called once the image has loaded or failed.
+  onSettled?: (url: string) => void
 }
 
 export default function ImageFrame({
@@ -25,12 +29,20 @@ export default function ImageFrame({
   onReveal,
   priority = false,
   frame = 'single',
+  deferred = false,
+  onSettled,
 }: ImageFrameProps) {
   const [result, setResult] = useState<{
     url: string | undefined
     status: 'loading' | 'loaded' | 'error'
   }>({ url: image?.url, status: 'loading' })
   const [retryCount, setRetryCount] = useState(0)
+  // A started request is never taken back: unmounting the <img> would drop a
+  // loaded image and blank the page when it is shown again.
+  const [started, setStarted] = useState(!deferred)
+  if (!deferred && !started) {
+    setStarted(true)
+  }
   const imgRef = useRef<HTMLImageElement | null>(null)
   const url = image?.url
   const status = result.url === url ? result.status : 'loading'
@@ -42,7 +54,13 @@ export default function ImageFrame({
       url,
       status: img?.complete ? (img.naturalWidth > 0 ? 'loaded' : 'error') : 'loading',
     })
-  }, [url, retryCount])
+  }, [url, retryCount, started])
+
+  useEffect(() => {
+    if (url && status !== 'loading') {
+      onSettled?.(url)
+    }
+  }, [url, status, onSettled])
 
   const { frameClass, backgroundClass, placeholderClass } = getFrameStyles(frame)
   const objectPositionClass = getObjectPositionClass(frame)
@@ -54,28 +72,30 @@ export default function ImageFrame({
   }
 
   const isBlurred = image.nsfw && !revealed
-  const loading = priority ? 'eager' : 'lazy'
   const fetchPriority = priority ? 'high' : 'auto'
 
   return (
     <div
       className={`relative h-full w-full overflow-hidden ${backgroundClass} backdrop-blur-sm ${frameClass}`}
     >
-      <img
-        key={`${image.url}:${retryCount}`}
-        ref={imgRef}
-        src={image.url}
-        alt={image.alt || `Manga page ${index + 1}`}
-        className={`h-full w-full select-none object-contain ${objectPositionClass} transition-opacity duration-500 ${
-          status === 'loaded' ? 'opacity-100' : 'opacity-0'
-        } ${isBlurred ? 'blur-2xl scale-[1.02]' : ''}`}
-        loading={loading}
-        fetchPriority={fetchPriority}
-        decoding="async"
-        onLoad={() => setResult({ url, status: 'loaded' })}
-        onError={() => setResult({ url, status: 'error' })}
-        draggable={false}
-      />
+      {started ? (
+        <img
+          key={`${image.url}:${retryCount}`}
+          ref={imgRef}
+          src={image.url}
+          alt={image.alt || `Manga page ${index + 1}`}
+          className={`h-full w-full select-none object-contain ${objectPositionClass} transition-opacity duration-500 ${
+            status === 'loaded' ? 'opacity-100' : 'opacity-0'
+          } ${isBlurred ? 'blur-2xl scale-[1.02]' : ''}`}
+          fetchPriority={fetchPriority}
+          // Async decoding lets the browser paint a turned page before its
+          // image is decoded, leaving it blank for a few frames.
+          decoding="sync"
+          onLoad={() => setResult({ url, status: 'loaded' })}
+          onError={() => setResult({ url, status: 'error' })}
+          draggable={false}
+        />
+      ) : null}
       {status === 'loading' && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/40">
           <div className="h-2 w-16 rounded-full bg-ink/20 animate-breath" />

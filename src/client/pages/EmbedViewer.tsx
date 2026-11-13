@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import Reader, { type ReaderLayout } from '../components/Reader'
 import StatusScreen from '../components/StatusScreen'
+import { loadFonts } from '../fonts'
 import {
   buildReaderPages,
   readErrorMessage,
@@ -113,6 +114,14 @@ export default function EmbedViewer() {
   }, [id, retryCount])
 
   const pages = useMemo(() => (data ? buildReaderPages(data) : []), [data])
+
+  // The reader requests fonts after its first page; these states never show one.
+  const showsReader = status === 'loading' || (status === 'ready' && pages.length > 0)
+  useEffect(() => {
+    if (!showsReader) {
+      loadFonts()
+    }
+  }, [showsReader])
 
   const viewerUrl = useMemo(() => {
     if (!id || typeof window === 'undefined') {

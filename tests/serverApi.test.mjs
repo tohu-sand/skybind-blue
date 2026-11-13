@@ -1200,6 +1200,77 @@ console.log('--- /api/manga/generate (existing-link reuse) ---')
   )
 }
 
+console.log('--- /api/manga/generate (canonical post URI) ---')
+{
+  // The AppView resolves handle-form at:// URIs; only its DID-form URI may be stored.
+  const rkey = 'rkgenh1'
+  const handleUri = `at://alice.example.com/app.bsky.feed.post/${rkey}`
+  setThreadPost(rkey, {
+    embed: {
+      $type: 'app.bsky.embed.images#view',
+      images: [{ fullsize: 'https://cdn.example.com/imgh1.jpg' }],
+    },
+  })
+  threads.set(handleUri, threads.get(postUri(rkey)))
+  const first = await post(
+    '/api/manga/generate',
+    { postUrl: handleUri, startSide: 'right' },
+    { auth: makeJwt() },
+  )
+  const firstBody = await expectResponse(
+    'generate accepts a handle-form at:// URI',
+    first,
+    200,
+  )
+  const row = db.rows.get(firstBody.id)
+  ok(
+    'DID-form URI stored and returned for a handle-form input',
+    row?.original_post_uri === postUri(rkey) &&
+      firstBody.rootUri === postUri(rkey) &&
+      firstBody.rootCid === SUBJECT_CID,
+    JSON.stringify({ body: firstBody, row }),
+  )
+  const second = await post(
+    '/api/manga/generate',
+    { postUrl: postUri(rkey), startSide: 'right' },
+    { auth: makeJwt() },
+  )
+  const secondBody = await expectResponse(
+    'DID-form request for the same post',
+    second,
+    200,
+  )
+  ok(
+    'URI spellings share one link',
+    secondBody.id === firstBody.id && secondBody.reused === true,
+    JSON.stringify(secondBody),
+  )
+}
+{
+  // A canonical URI outside the caller's repo must never be stored.
+  const rkey = 'rkgenh2'
+  const handleUri = `at://alice.example.com/app.bsky.feed.post/${rkey}`
+  threads.set(handleUri, {
+    uri: postUri(rkey, OTHER),
+    cid: SUBJECT_CID,
+    author: { did: AUTHOR },
+    record: { createdAt: '2026-08-01T00:00:00.000Z', text: '' },
+    replyCount: 0,
+    embed: {
+      $type: 'app.bsky.embed.images#view',
+      images: [{ fullsize: 'https://cdn.example.com/imgh2.jpg' }],
+    },
+  })
+  const before = db.rows.size
+  const res = await post(
+    '/api/manga/generate',
+    { postUrl: handleUri, startSide: 'right' },
+    { auth: makeJwt() },
+  )
+  await expectResponse('canonical URI in another repo -> 403', res, 403, '作者本人')
+  ok('no row stored for a foreign canonical URI', db.rows.size === before)
+}
+
 console.log('--- /api/manga/complete rate limiting ---')
 {
   const ip = '198.51.100.77'
@@ -1579,6 +1650,71 @@ console.log('--- pending lazy self-repair (viewer GET) ---')
     await res.body?.cancel?.()
   }
   ok('repair scans rate limited per link (3/window)', feedCalls() - before === 3, String(feedCalls() - before))
+}
+
+console.log('--- viewer GET (cache key / id validation) ---')
+{
+  const id = 'lnkcache01'
+  const rkey = 'rkcache1'
+  addRow(id, { state: 'active', original_post_uri: postUri(rkey) })
+  setThreadPost(rkey, {
+    embed: {
+      $type: 'app.bsky.embed.images#view',
+      images: [{ fullsize: 'https://cdn.example.com/cache1.jpg' }],
+    },
+  })
+  // Replace the always-miss cache with a real store for this block.
+  const noCache = globalThis.caches
+  const stored = new Map()
+  globalThis.caches = {
+    default: {
+      async match(request) {
+        return stored.get(request.url)?.clone()
+      },
+      async put(request, response) {
+        stored.set(request.url, response)
+      },
+    },
+  }
+  try {
+    const threadCalls = () =>
+      fetchLog.filter((u) => u.includes('getPostThread')).length
+    const res1 = await send(`/api/manga/${id}?x=1`, 'GET')
+    await expectResponse('viewer GET with a query string', res1, 200)
+    const afterFirst = threadCalls()
+    const res2 = await send(`/api/manga/${id}?x=2`, 'GET')
+    const body2 = await expectResponse('different query string still served', res2, 200)
+    ok(
+      'query string cannot bypass the viewer cache',
+      threadCalls() === afterFirst && body2.id === id,
+      String(threadCalls() - afterFirst),
+    )
+    ok(
+      'cache keyed on the bare path',
+      stored.size === 1 && [...stored.keys()][0].endsWith(`/api/manga/${id}`),
+      JSON.stringify([...stored.keys()]),
+    )
+  } finally {
+    globalThis.caches = noCache
+  }
+}
+{
+  // IDs outside the link ID alphabet cannot exist; answer without a DB lookup.
+  const originalPrepare = db.prepare
+  let prepared = 0
+  db.prepare = (sql) => {
+    prepared += 1
+    return originalPrepare.call(db, sql)
+  }
+  try {
+    const tooLong = await send(`/api/manga/${'a'.repeat(33)}`, 'GET')
+    await expectResponse('over-long link id -> 404', tooLong, 404, '見つかりません')
+    const badChars = await send('/api/manga/bad.id', 'GET')
+    await expectResponse('link id with invalid characters -> 404', badChars, 404, '見つかりません')
+    ok('malformed ids never reach the DB', prepared === 0, String(prepared))
+  } finally {
+    db.prepare = originalPrepare
+  }
 }
 
 console.log('--- quota (creation-path purge + atomic guard) ---')
